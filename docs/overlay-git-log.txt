@@ -1,0 +1,19 @@
+9de96de 2026-09-17T18:29:40+00:00 rdna2-moe: ignore build artifacts
+392ab6b 2026-09-17T18:25:06+00:00 v620-pp3 MoE HIP: routed_experts recognises CompressedTensorsWNA16RDNA2MoEMethod (transposed compressed-tensors load, intermediate_size_full)
+cfcde9d 2026-09-17T18:22:04+00:00 v620-pp3 MoE HIP: supply intermediate_size_full in create_weights (leapdragon RoutedExperts matches exact class names)
+e3718ac 2026-09-17T18:14:29+00:00 v620-pp3: port opengfx1030 fused W4A16 MoE HIP kernel (moe_gptq_gemm_rdna2) to the leapdragon tree as a standalone torch extension + CompressedTensorsWNA16RDNA2MoEMethod + gfx10x dispatch (V620_MOE_HIP=0 disables)
+1cf8bb2 2026-09-17T18:09:15+00:00 v620-pp3: tuned int4 MoE Triton config for E=512 (PP3, no EP) — copy of leapdragon E=128 rows (num_stages=1)
+5697c39 2026-09-17T12:20:26+00:00 v620-pp3: backport vllm#54044 (reset cached Mamba align metadata on profiling teardown) — MTP + cudagraphs under PP
+38a2c9f 2026-09-17T11:14:19+00:00 v620-pp3 MTP: backport recipe 0009 / vllm#46994 draft-token PP relay (broadcast_draft) from opengfx1030 22bb2e8
+2772705 2026-09-17T11:14:19+00:00 v620-pp3: snapshot before 0009 backport
+79a8e65 2026-09-15T20:59:32+00:00 v620-pp3: V1 runner attempt (aiter import guard, extracted proposer files)
+9397891 2026-09-15T20:38:24+00:00 v620-pp3: lift the V1-runner PP guard, sampler trace (V620_PLE_TRACE), pp_utils trace
+748ca2c 2026-09-15T19:57:02+00:00 v620-pp3 MTP: pad the PP sampled-token broadcast to max_sample_len (fixes warmup deadlock)
+b9d431e 2026-09-15T19:31:37+00:00 v620-pp3: V620_PLE_TRACE instrumentation of the PLE semaphore protocol
+84f351a 2026-09-15T18:51:37+00:00 v620-pp3 MTP: the draft head embeds on the last stage (it runs whole there)
+e8ebe9d 2026-09-15T18:44:35+00:00 v620-pp3 MTP: CPU placeholders for draft embed/lm_head, share embedding under PP, blockwise int8 shadows
+010a90e 2026-09-15T15:08:39+00:00 v620-pp3: worker ignore partition
+0492241 2026-09-15T14:23:04+00:00 v620-pp3: ignore_unexpected_prefixes
+d49f085 2026-09-15T14:22:37+00:00 v620-pp3: skip final mixer weights on non-last stages
+50b8df0 2026-09-15T14:15:28+00:00 v620-pp3 sur les fichiers de l image
+1f8f799 2026-09-15T14:14:21+00:00 originaux image

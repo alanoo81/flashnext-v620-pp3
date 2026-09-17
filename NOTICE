@@ -1,0 +1,12 @@
+flashnext-v620-pp3 — working tree for Qwen3.8-Flash-Next on 3x Radeon PRO V620 (vLLM, PP=3)
+
+This repository contains only deltas (overlay files, patches, a kernel extension, a test harness, reports).
+- overlay/ and patches/leapdragon/: modified copies of files from leapdragon/vllm-rdna2-qwen (branch rdna2/qwen38-flash-next,
+  image ghcr.io/leapdragon/vllm-rdna2-qwen:20260915-g1bdbbef4b), itself derived from vllm-project/vllm. Apache-2.0.
+- rdna2-moe/moe_q_gemm_rdna2.cu, q_gemm_rdna2_common.cuh, qdq_4_rdna2.cuh and
+  overlay/.../compressed_tensors_moe_wna16_rdna2.py: from opengfx1030/vllm-rdna (branch rdna_extras, 50120e1), unchanged
+  except for the op namespace. Apache-2.0.
+- patches/rdna_extras/: patches on opengfx1030/vllm-rdna. Apache-2.0.
+- overlay/vllm/v1/worker/gpu/pp_utils.py draft relay: recipe 0009 of leapdragon/vllm-rdna2-recipe and vllm-project/vllm PR #46994;
+  overlay/vllm/v1/worker/gpu/cudagraph_utils.py: vllm-project/vllm PR #54044.
+Everything else (harness, launchers, docs) by the authors of this repository, Apache-2.0.

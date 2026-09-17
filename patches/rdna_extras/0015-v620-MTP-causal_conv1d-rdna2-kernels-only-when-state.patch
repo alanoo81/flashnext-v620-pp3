@@ -1,0 +1,37 @@
+From a15d31fe6b4e0f688617ad0233ca5645dbf80a66 Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Thu, 17 Sep 2026 15:57:49 +0000
+Subject: [PATCH 15/16] v620 MTP: causal_conv1d rdna2 kernels only when
+ state_len == width-1 (spec decode widens the conv state)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vugn8vGjCf8fVWViDZHdko
+---
+ vllm/model_executor/layers/mamba/ops/causal_conv1d.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+index ea24891309..e48e776859 100644
+--- a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
++++ b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+@@ -735,6 +735,9 @@ def causal_conv1d_fn(
+         and block_idx_last_scheduled_token is None
+         and hasattr(torch.ops, "_rocm_C")
+         and hasattr(torch.ops._rocm_C, "causal_conv1d_fwd_rdna2")
++        # v620: the HIP kernel needs state_len == width-1; spec decode widens the
++        # conv state to width-1+num_spec, fall back to Triton in that case.
++        and conv_states.size(-1) == width - 1
+     ):
+         import os as _os
+         if _os.environ.get("VLLM_CONV1D_DEBUG") == "1" and not getattr(causal_conv1d_fn, "_logged", False):
+@@ -1300,6 +1303,7 @@ def causal_conv1d_update(
+         and dim % 32 == 0
+         and hasattr(torch.ops, "_rocm_C")
+         and hasattr(torch.ops._rocm_C, "causal_conv1d_update_rdna2")
++        and conv_state.size(-1) == width - 1  # v620: see causal_conv1d_fn
+     ):
+         x_in = x.contiguous() if not x.is_contiguous() else x
+         out_in = out.contiguous() if not out.is_contiguous() else out
+-- 
+2.43.0
+

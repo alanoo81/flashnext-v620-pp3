@@ -1,0 +1,30 @@
+From 9cc58b311faa4ee08bd108b25b5bba6df7839e8a Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Thu, 17 Sep 2026 15:35:38 +0000
+Subject: [PATCH 11/16] v620 MTP: tolerate missing _v620_mark instrumentation
+ in the PLE connector
+
+---
+ vllm/v1/ple_offload/connector.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 70064bdbb4..5e1ec8bbcd 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -4,7 +4,11 @@
+ 
+ import os
+ _V620_TRACE = os.environ.get("V620_PLE_TRACE") == "1"
+-from vllm.model_executor.layers.ple_offload_layer import _v620_mark
++try:
++    from vllm.model_executor.layers.ple_offload_layer import _v620_mark
++except ImportError:  # instrumentation V620 absente sur cet arbre
++    def _v620_mark(*a, **k):
++        return None
+ def _v620_log(msg):
+     if _V620_TRACE:
+         import sys, time as _t
+-- 
+2.43.0
+

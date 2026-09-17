@@ -1,0 +1,160 @@
+From 739d45462986f57da90daf0250256058505cfc37 Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Wed, 16 Sep 2026 21:59:55 +0000
+Subject: [PATCH 09/16] =?UTF-8?q?v620:=20diagnostics=20=E2=80=94=20V620=5F?=
+ =?UTF-8?q?RMS=5FC=3D1=20forces=20=5FC=20rms=20norms=20(no=20HIP=20gated?=
+ =?UTF-8?q?=20norm),=20V620=5FDUMP=20layer=20hooks?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ v620_dump.py                                  | 76 +++++++++++++++++++
+ vllm/_custom_ops.py                           |  3 +
+ vllm/model_executor/layers/layernorm.py       |  3 +
+ .../model_loader/base_loader.py               |  4 +
+ 4 files changed, 86 insertions(+)
+ create mode 100644 v620_dump.py
+
+diff --git a/v620_dump.py b/v620_dump.py
+new file mode 100644
+index 0000000000..e9bdc7b854
+--- /dev/null
++++ b/v620_dump.py
+@@ -0,0 +1,76 @@
++# Instrumentation V620 : hooks forward sur chaque couche décodeur Qwen4Exp (et ses sous-modules de 1er niveau),
++# enregistre par étape (chunk de prefill / pas de décodage) les vecteurs du dernier token et du token 100,
++# plus des stats globales, pour comparer deux arbres vLLM couche par couche.
++# Activation : V620_DUMP=<dossier de sortie> ; V620_DUMP_STEPS=<nb d'étapes max, défaut 8>.
++import os, re, torch
++
++_STATE = {"step": -1, "first": None, "rec": {}, "dir": None, "max_steps": 8, "rank": "r?"}
++
++
++def _summ(t: torch.Tensor):
++    if not isinstance(t, torch.Tensor) or t.numel() == 0 or t.dtype in (torch.int32, torch.int64, torch.bool):
++        return None
++    x = t.detach()
++    if x.ndim == 1:
++        x = x.unsqueeze(0)
++    n = x.shape[0]
++    flat = x.reshape(n, -1).float()
++    return {
++        "shape": tuple(t.shape), "dtype": str(t.dtype), "n": n,
++        "last": flat[-1].cpu(), "t100": flat[min(100, n - 1)].cpu(),
++        "absmean": flat.abs().mean().item(), "absmax": flat.abs().max().item(),
++        "nan": int(torch.isnan(flat).sum().item()),
++    }
++
++
++def _hook(name):
++    def fn(mod, inp, out):
++        st = _STATE
++        if name == st["first"]:
++            st["step"] += 1
++            if st["step"] >= st["max_steps"]:
++                return
++        if st["step"] < 0 or st["step"] >= st["max_steps"]:
++            return
++        outs = out if isinstance(out, (tuple, list)) else (out,)
++        for i, o in enumerate(outs):
++            s = _summ(o)
++            if s is not None:
++                st["rec"].setdefault(st["step"], {})[f"{name}#{i}"] = s
++        # entrée principale de la couche (premier tenseur) pour situer une divergence en amont
++        if inp and isinstance(inp[0], torch.Tensor):
++            s = _summ(inp[0])
++            if s is not None:
++                st["rec"].setdefault(st["step"], {})[f"{name}@in"] = s
++        if name == st["last"]:
++            torch.save({"rank": st["rank"], "rec": st["rec"]}, os.path.join(st["dir"], f"rank{st['rank']}.pt"))
++    return fn
++
++
++def install(model):
++    d = os.environ.get("V620_DUMP")
++    if not d:
++        return
++    try:
++        import torch.distributed as dist
++        rank = dist.get_rank() if dist.is_initialized() else os.getpid()
++    except Exception:
++        rank = os.getpid()
++    _STATE.update(dir=d, rank=str(rank), max_steps=int(os.environ.get("V620_DUMP_STEPS", "8")))
++    os.makedirs(d, exist_ok=True)
++    layer_re = re.compile(r"^(.*\.layers\.(\d+))$")
++    layers = []
++    for name, mod in model.named_modules():
++        m = layer_re.match(name)
++        if m and type(mod).__name__ != "PPMissingLayer" and any(True for _ in mod.parameters()):
++            layers.append((int(m.group(2)), name, mod))
++    layers.sort()
++    if not layers:
++        return
++    _STATE["first"], _STATE["last"] = layers[0][1], layers[-1][1]
++    n = 0
++    for idx, name, mod in layers:
++        mod.register_forward_hook(_hook(name)); n += 1
++        for sub, smod in mod.named_children():   # ple, linear_attn/self_attn, mlp, norms, hc...
++            smod.register_forward_hook(_hook(f"{name}.{sub}")); n += 1
++    print(f"[v620_dump] rank {rank}: {n} hooks, layers {layers[0][0]}..{layers[-1][0]} -> {d}", flush=True)
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index b7c3747254..1bb66a0e13 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -4,6 +4,7 @@
+ from enum import IntEnum
+ from typing import TYPE_CHECKING, Literal
+ 
++import os
+ import torch
+ from torch._subclasses.fake_tensor import FakeTensor
+ 
+@@ -242,6 +243,7 @@ def rms_norm(
+         and torch.version.hip is not None
+         and hasattr(torch.ops, "_rocm_C")
+         and hasattr(torch.ops._rocm_C, "rms_norm")
++        and os.environ.get("V620_RMS_C") != "1"  # v620 diag: force the _C kernels
+     ):
+         torch.ops._rocm_C.rms_norm(out, input, weight, epsilon)
+     else:
+@@ -292,6 +294,7 @@ def fused_add_rms_norm(
+         and torch.version.hip is not None
+         and hasattr(torch.ops, "_rocm_C")
+         and hasattr(torch.ops._rocm_C, "fused_add_rms_norm")
++        and os.environ.get("V620_RMS_C") != "1"
+     ):
+         torch.ops._rocm_C.fused_add_rms_norm(input, residual, weight, epsilon)
+     else:
+diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+index 5e81ed5890..3e77ddc3e3 100644
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -337,6 +337,9 @@ class RMSNormGated(CustomOp):
+         # kernel covers Qwen3.x GDN (group=None, norm_before_gate, fp16);
+         # anything else falls back to forward_native inside forward_hip.
+         from vllm.platforms import current_platform
++        import os as _os
++        if _os.environ.get("V620_RMS_C") == "1":  # v620 diag: no HIP gated norm
++            return super().enabled()
+ 
+         if (
+             current_platform.is_rocm()
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index d1f44666c5..cdbe58cf88 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -79,6 +79,10 @@ class BaseModelLoader(ABC):
+ 
+             process_weights_after_loading(model, model_config, target_device)
+ 
++        import os as _os
++        if _os.environ.get("V620_DUMP"):
++            from v620_dump import install as _v620_install
++            _v620_install(model)
+         return model.eval()
+ 
+ 
+-- 
+2.43.0
+

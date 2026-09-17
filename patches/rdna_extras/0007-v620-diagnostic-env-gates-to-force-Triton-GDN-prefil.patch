@@ -1,0 +1,50 @@
+From a000fafe6337e116debdb360640333474ed1a9db Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Tue, 15 Sep 2026 15:56:11 +0000
+Subject: [PATCH 07/16] v620: diagnostic env gates to force Triton GDN prefill
+ / Triton WNA16 MoE on gfx1030
+
+---
+ vllm/model_executor/layers/fused_moe/oracle/int_wna16.py     | 4 +++-
+ vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py | 3 ++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index f3f4ee0f79..59f56409c1 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import sys
+ from enum import Enum
+ from typing import Any
+@@ -124,8 +125,9 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
+     from vllm.platforms.rocm import on_gfx10x
+ 
+     backends: list[WNA16MoEBackend] = []
++    # v620 diagnostic: V620_MOE_TRITON=1 skips the native RDNA2 W4A16 MoE kernel
+     if on_gfx10x() and hasattr(torch.ops, "_rocm_C") and \
+-            hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna2"):
++            hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna2") and os.getenv("V620_MOE_TRITON") != "1":
+         backends.append(WNA16MoEBackend.RDNA2_W4A16)
+     backends.extend([
+         WNA16MoEBackend.FLASHINFER_TRTLLM,
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index af319710a9..cb56e77050 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -194,7 +194,8 @@ def _resolve_gdn_prefill_backend(
+     )
+     backend = str(backend_cfg).strip().lower()
+ 
+-    if current_platform.is_rocm() and _gdn_prefill_dispatch_available():
++    # v620 diagnostic: V620_GDN_TRITON=1 forces the Triton/FLA prefill path on gfx1030
++    if current_platform.is_rocm() and _gdn_prefill_dispatch_available() and os.getenv("V620_GDN_TRITON") != "1":
+         return backend, "rdna2"
+ 
+     if not current_platform.is_cuda():
+-- 
+2.43.0
+

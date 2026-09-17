@@ -1,0 +1,33 @@
+From 05b5278f6c266a40f2c9285e5248cf26fbfdd6a0 Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Tue, 15 Sep 2026 15:19:38 +0000
+Subject: [PATCH 06/16] v620-pp3: lift the PP guard in gpu_model_runner (PLE on
+ stage 0)
+
+---
+ vllm/v1/worker/gpu_model_runner.py | 9 ++-------
+ 1 file changed, 2 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 33f12bfae7..bf8c5b078b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -597,13 +597,8 @@ class GPUModelRunner(
+             self.ngram_eos_token_id = 0
+         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
+             raise ValueError("N-gram embedding requires context length >= 1.")
+-        if self.uses_ngram_embedding and len(get_pp_group().ranks) > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1. With PP>1, ngram context is only "
+-                "injected on the first rank and can become incorrect on "
+-                "non-first ranks. Please run with PP=1."
+-            )
++        # v620-pp3: with PP > 1 the PLE layer lives on the first stage only, which is
++        # also the rank that injects the ngram context; the other stages never use it.
+ 
+         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
+         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
+-- 
+2.43.0
+

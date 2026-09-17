@@ -1,0 +1,70 @@
+From b649be8f65e25a9e8e5d11d3b6fbea6f0788e75a Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Wed, 16 Sep 2026 22:27:03 +0000
+Subject: [PATCH] =?UTF-8?q?fix(rocm,gdn):=20drop=20the=20one-shot=20conv/s?=
+ =?UTF-8?q?sm=20state=20cache=20zero=5F()=20sanitizers=20=E2=80=94=20they?=
+ =?UTF-8?q?=20wipe=20the=20first=20request=20s=20prefill=20state=20at=20it?=
+ =?UTF-8?q?s=20first=20decode=20(allocate=5Fkv=5Fcache=20already=20zero-fi?=
+ =?UTF-8?q?lls)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ v620_dump.py                                  |  2 ++
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  | 19 +++++--------------
+ 2 files changed, 7 insertions(+), 14 deletions(-)
+
+diff --git a/v620_dump.py b/v620_dump.py
+index e9bdc7b..987f298 100644
+--- a/v620_dump.py
++++ b/v620_dump.py
+@@ -27,6 +27,8 @@ def _hook(name):
+     def fn(mod, inp, out):
+         st = _STATE
+         if name == st["first"]:
++            if not os.path.exists(os.path.join(st["dir"], ".go")):  # n'enregistrer qu'après le drapeau (saute warmup/profilage)
++                return
+             st["step"] += 1
+             if st["step"] >= st["max_steps"]:
+                 return
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 75092fa..371f8ef 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -675,11 +675,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # garbage into NaN and it propagates to the layer hidden states. Commit
+         # both caches once (before the first gather) so the gather reads
+         # committed zeros instead of uncommitted garbage.
+-        if not getattr(self, "_rdna2_cache_sanitized", False):
+-            with torch.no_grad():
+-                conv_state.zero_()
+-                ssm_state.zero_()
+-            self._rdna2_cache_sanitized = True
++        # v620 fix: same one-shot conv/ssm zero_() removed here (see _forward_core_decode_non_spec).
+         gather_gdn_state_arenas(
+             conv_state, ssm_state, conv_arena, ssm_arena, cache_slots, num
+         )
+@@ -2116,15 +2112,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 # zero pages instead of RDNA2 uncommitted-page garbage.
+                 # Mirrors the torch.zeros fix used for the EXL3 lm_head
+                 # dequant output buffer (same RDNA2 page-commit guard).
+-                if not self._rdna2_ssm_sanitized:
+-                    # Host sync (.item()) is illegal under cudagraph capture,
+-                    # and the first decode for a fresh request runs INSIDE the
+-                    # capture (M=16). The paged state caches are torch.empty
+-                    # on RDNA2 (uncommitted pages), so the first state read is
+-                    # garbage. zero_() commits the pages without a host sync,
+-                    # so it is safe under capture.
+-                    ssm_state.zero_()
+-                    self._rdna2_ssm_sanitized = True
++                # v620 fix: the one-shot ssm_state.zero_() that used to live here wiped the
++                # whole paged state cache at the first decode of the process, i.e. right after
++                # the first request s prefill wrote its final state (allocate_kv_cache already
++                # uses torch.zeros, so nothing is uncommitted).
+                 import os as _os
+                 if _os.environ.get("VLLM_GDN_STATE_DEBUG") == "1":
+                     try:
+-- 
+2.43.0
+

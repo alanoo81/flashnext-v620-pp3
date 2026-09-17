@@ -1,0 +1,527 @@
+nested array `top_logprobs`. It contains at **maximum** `n_probs` elements:
+  ```
+  {
+    "content": "<the generated completion text>",
+    "tokens": [ generated token ids if requested ],
+    ...
+    "probs": [
+      {
+        "id": <token id>,
+        "logprob": float,
+        "token": "<most likely token>",
+        "bytes": [int, int, ...],
+        "top_logprobs": [
+          {
+            "id": <token id>,
+            "logprob": float,
+            "token": "<token text>",
+            "bytes": [int, int, ...],
+          },
+          {
+            "id": <token id>,
+            "logprob": float,
+            "token": "<token text>",
+            "bytes": [int, int, ...],
+          },
+          ...
+        ]
+      },
+      {
+        "id": <token id>,
+        "logprob": float,
+        "token": "<most likely token>",
+        "bytes": [int, int, ...],
+        "top_logprobs": [
+          ...
+        ]
+      },
+      ...
+    ]
+  },
+  ```
+  Please note that if `post_sampling_probs` is set to `true`:
+    - `logprob` will be replaced with `prob`, with the value between 0.0 and 1.0
+    - `top_logprobs` will be replaced with `top_probs`. Each element contains:
+      - `id`: token ID
+      - `token`: token in string
+      - `bytes`: token in bytes
+      - `prob`: token probability, with the value between 0.0 and 1.0
+    - Number of elements in `top_probs` may be less than `n_probs`
+
+- `content`: Completion result as a string (excluding `stopping_word` if any). In case of streaming mode, will contain the next token as a string.
+- `tokens`: Same as `content` but represented as raw token ids. Only populated if `"return_tokens": true` or `"stream": true` in the request.
+- `stop`: Boolean for use with `stream` to check whether the generation has stopped (Note: This is not related to stopping words array `stop` from input options)
+- `generation_settings`: The provided options above excluding `prompt` but including `n_ctx`, `model`. These options may differ from the original ones in some way (e.g. bad values filtered out, strings converted to tokens, etc.).
+- `model`: The model alias (for model path, please use `/props` endpoint)
+- `prompt`: The processed `prompt` (special tokens may be added)
+- `stop_type`: Indicating whether the completion has stopped. Possible values are:
+  - `none`: Generating (not stopped)
+  - `eos`: Stopped because it encountered the EOS token
+  - `limit`: Stopped because `n_predict` tokens were generated before stop words or EOS was encountered
+  - `word`: Stopped due to encountering a stopping word from `stop` JSON array provided
+- `stopping_word`: The stopping word encountered which stopped the generation (or "" if not stopped due to a stopping word)
+- `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`
+- `tokens_cached`: Number of tokens from the prompt which could be re-used from previous completion
+- `tokens_evaluated`: Number of tokens evaluated in total from the prompt
+- `truncated`: Boolean indicating if the context size was exceeded during generation, i.e. the number of tokens provided in the prompt (`tokens_evaluated`) plus tokens generated (`tokens predicted`) exceeded the context size (`n_ctx`)
+
+
+### POST `/tokenize`: Tokenize a given text
+
+*Options:*
+
+`content`: (Required) The text to tokenize.
+
+`add_special`: (Optional) Boolean indicating if special tokens, i.e. `BOS`, should be inserted.  Default: `false`
+
+`parse_special`: (Optional) Boolean indicating if special tokens should be tokenized. When `false` special tokens are treated as plaintext.  Default: `true`
+
+`with_pieces`: (Optional) Boolean indicating whether to return token pieces along with IDs.  Default: `false`
+
+**Response:**
+
+Returns a JSON object with a `tokens` field containing the tokenization result. The `tokens` array contains either just token IDs or objects with `id` and `piece` fields, depending on the `with_pieces` parameter. The piece field is a string if the piece is valid unicode or a list of bytes otherwise.
+
+
+If `with_pieces` is `false`:
+```json
+{
+  "tokens": [123, 456, 789]
+}
+```
+
+If `with_pieces` is `true`:
+```json
+{
+  "tokens": [
+    {"id": 123, "piece": "Hello"},
+    {"id": 456, "piece": " world"},
+    {"id": 789, "piece": "!"}
+  ]
+}
+```
+
+With input 'á' (utf8 hex: C3 A1) on tinyllama/stories260k
+```
+{
+  "tokens": [
+    {"id": 198, "piece": [195]}, // hex C3
+    {"id": 164, "piece": [161]} // hex A1
+  ]
+}
+```
+
+### POST `/detokenize`: Convert tokens to text
+
+*Options:*
+
+`tokens`: Set the tokens to detokenize.
+
+### POST `/apply-template`: Apply chat template to a conversation
+
+Uses the server's prompt template formatting functionality to convert chat messages to a single string expected by a chat model as input, but does not perform inference. Instead, the prompt string is returned in the `prompt` field of the JSON response. The prompt can then be modified as desired (for example, to insert "Sure!" at the beginning of the model's response) before sending to `/completion` to generate the chat response.
+
+*Options:*
+
+`messages`: (Required) Chat turns in the same format as `/v1/chat/completions`.
+
+**Response format**
+
+Returns a JSON object with a field `prompt` containing a string of the input messages formatted according to the model's chat template format.
+
+### POST `/embedding`: Generate embedding of a given text
+
+> [!IMPORTANT]
+>
+> This endpoint is **not** OAI-compatible. For OAI-compatible client, use `/v1/embeddings` instead.
+
+The same as [the embedding example](../embedding) does.
+
+This endpoint also supports multimodal embeddings. See the documentation for the `/completions` endpoint for details on how to send a multimodal prompt.
+
+*Options:*
+
+`content`: Set the text to process.
+
+`embd_normalize`: Normalization for pooled embeddings. Can be one of the following values:
+```
+  -1: No normalization
+   0: Max absolute
+   1: Taxicab
+   2: Euclidean/L2
+  >2: P-Norm
+```
+
+### POST `/reranking`: Rerank documents according to a given query
+
+Similar to https://jina.ai/reranker/ but might change in the future.
+Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)) and the `--embedding --pooling rank` options.
+
+*Options:*
+
+`query`: The query against which the documents will be ranked.
+
+`documents`: An array strings representing the documents to be ranked.
+
+*Aliases:*
+  - `/rerank`
+  - `/v1/rerank`
+  - `/v1/reranking`
+
+*Examples:*
+
+```shell
+curl http://127.0.0.1:8012/v1/rerank \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "some-model",
+            "query": "What is panda?",
+            "top_n": 3,
+            "documents": [
+                "hi",
+            "it is a bear",
+            "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China."
+            ]
+    }' | jq
+```
+
+### POST `/infill`: For code infilling.
+
+Takes a prefix and a suffix and returns the predicted completion as stream.
+
+*Options:*
+
+- `input_prefix`: Set the prefix of the code to infill.
+- `input_suffix`: Set the suffix of the code to infill.
+- `input_extra`:  Additional context inserted before the FIM prefix.
+- `prompt`:       Added after the `FIM_MID` token
+
+`input_extra` is array of `{"filename": string, "text": string}` objects.
+
+The endpoint also accepts all the options of `/completion`.
+
+If the model has `FIM_REPO` and `FIM_FILE_SEP` tokens, the [repo-level pattern](https://arxiv.org/pdf/2409.12186) is used:
+
+```txt
+<FIM_REP>myproject
+<FIM_SEP>{chunk 0 filename}
+{chunk 0 text}
+<FIM_SEP>{chunk 1 filename}
+{chunk 1 text}
+...
+<FIM_SEP>filename
+<FIM_PRE>[input_prefix]<FIM_SUF>[input_suffix]<FIM_MID>[prompt]
+```
+
+If the tokens are missing, then the extra context is simply prefixed at the start:
+
+```txt
+[input_extra]<FIM_PRE>[input_prefix]<FIM_SUF>[input_suffix]<FIM_MID>[prompt]
+```
+
+### **GET** `/props`: Get server global properties.
+
+By default, it is read-only. To make POST request to change global properties, you need to start server with `--props`
+
+**Response format**
+
+```json
+{
+  "default_generation_settings": {
+    "id": 0,
+    "id_task": -1,
+    "n_ctx": 1024,
+    "speculative": false,
+    "is_processing": false,
+    "params": {
+      "n_predict": -1,
+      "seed": 4294967295,
+      "temperature": 0.800000011920929,
+      "dynatemp_range": 0.0,
+      "dynatemp_exponent": 1.0,
+      "top_k": 40,
+      "top_p": 0.949999988079071,
+      "min_p": 0.05000000074505806,
+      "xtc_probability": 0.0,
+      "xtc_threshold": 0.10000000149011612,
+      "typical_p": 1.0,
+      "repeat_last_n": 64,
+      "repeat_penalty": 1.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "dry_multiplier": 0.0,
+      "dry_base": 1.75,
+      "dry_allowed_length": 2,
+      "dry_penalty_last_n": 64,
+      "dry_sequence_breakers": [
+        "\n",
+        ":",
+        "\"",
+        "*"
+      ],
+      "mirostat": 0,
+      "mirostat_tau": 5.0,
+      "mirostat_eta": 0.10000000149011612,
+      "stop": [],
+      "max_tokens": -1,
+      "n_keep": 0,
+      "n_discard": 0,
+      "ignore_eos": false,
+      "stream": true,
+      "n_probs": 0,
+      "min_keep": 0,
+      "grammar": "",
+      "samplers": [
+        "dry",
+        "top_k",
+        "typ_p",
+        "top_p",
+        "min_p",
+        "xtc",
+        "temperature"
+      ],
+      "speculative.n_max": 16,
+      "speculative.n_min": 5,
+      "speculative.p_min": 0.8999999761581421,
+      "timings_per_token": false
+    },
+    "prompt": "",
+    "next_token": {
+      "has_next_token": true,
+      "has_new_line": false,
+      "n_remain": -1,
+      "n_decoded": 0,
+      "stopping_word": ""
+    }
+  },
+  "total_slots": 1,
+  "model_path": "../models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "chat_template": "...",
+  "chat_template_caps": {},
+  "modalities": {
+    "vision": false
+  },
+  "media_marker": "<__media_YoNhud46VdDqbuFmKYEO9PY7A4ARzRfg__>",
+  "build_info": "b(build number)-(build commit hash)",
+  "is_sleeping": false
+}
+```
+
+- `default_generation_settings` - the default generation settings for the `/completion` endpoint, which has the same fields as the `generation_settings` response object from the `/completion` endpoint.
+- `total_slots` - the total number of slots for process requests (defined by `--parallel` option)
+- `model_path` - the path to model file (same with `-m` argument)
+- `chat_template` - the model's original Jinja2 prompt template
+- `chat_template_caps` - capabilities of the chat template (see `common/jinja/caps.h` for more info)
+- `modalities` - the list of supported modalities
+- `is_sleeping` - sleeping status, see [Sleeping on idle](#sleeping-on-idle)
+
+### POST `/props`: Change server global properties.
+
+To use this endpoint with POST method, you need to start server with `--props`
+
+*Options:*
+
+- None yet
+
+### POST `/embeddings`: non-OpenAI-compatible embeddings API
+
+This endpoint supports all poolings, including `--pooling none`. When the pooling is `none`, the responses will contain the *unnormalized* embeddings for *all* input tokens. For all other pooling types, only the pooled embeddings are returned, normalized using Euclidean norm.
+
+Note that the response format of this endpoint is different from `/v1/embeddings`.
+
+*Options:*
+
+Same as the `/v1/embeddings` endpoint.
+
+*Examples:*
+
+Same as the `/v1/embeddings` endpoint.
+
+**Response format**
+
+```
+[
+  {
+    "index": 0,
+    "embedding": [
+      [ ... embeddings for token 0   ... ],
+      [ ... embeddings for token 1   ... ],
+      [ ... ]
+      [ ... embeddings for token N-1 ... ],
+    ]
+  },
+  ...
+  {
+    "index": P,
+    "embedding": [
+      [ ... embeddings for token 0   ... ],
+      [ ... embeddings for token 1   ... ],
+      [ ... ]
+      [ ... embeddings for token N-1 ... ],
+    ]
+  }
+]
+```
+
+### GET `/slots`: Returns the current slots processing state
+
+This endpoint is enabled by default and can be disabled with `--no-slots`. It can be used to query various per-slot metrics, such as speed, processed tokens, sampling parameters, etc.
+
+If query param `?fail_on_no_slot=1` is set, this endpoint will respond with status code 503 if there is no available slots.
+
+**Response format**
+
+<details>
+<summary>Example with 2 slots</summary>
+
+```json
+[
+  {
+    "id": 0,
+    "id_task": 135,
+    "n_ctx": 65536,
+    "speculative": false,
+    "is_processing": true,
+    "params": {
+      "n_predict": -1,
+      "seed": 4294967295,
+      "temperature": 0.800000011920929,
+      "dynatemp_range": 0.0,
+      "dynatemp_exponent": 1.0,
+      "top_k": 40,
+      "top_p": 0.949999988079071,
+      "min_p": 0.05000000074505806,
+      "top_n_sigma": -1.0,
+      "xtc_probability": 0.0,
+      "xtc_threshold": 0.10000000149011612,
+      "typical_p": 1.0,
+      "repeat_last_n": 64,
+      "repeat_penalty": 1.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "dry_multiplier": 0.0,
+      "dry_base": 1.75,
+      "dry_allowed_length": 2,
+      "dry_penalty_last_n": 131072,
+      "mirostat": 0,
+      "mirostat_tau": 5.0,
+      "mirostat_eta": 0.10000000149011612,
+      "max_tokens": -1,
+      "n_keep": 0,
+      "n_discard": 0,
+      "ignore_eos": false,
+      "stream": true,
+      "n_probs": 0,
+      "min_keep": 0,
+      "chat_format": "GPT-OSS",
+      "reasoning_format": "none",
+      "reasoning_in_content": false,
+      "generation_prompt": "",
+      "samplers": [
+        "penalties",
+        "dry",
+        "top_k",
+        "typ_p",
+        "top_p",
+        "min_p",
+        "xtc",
+        "temperature"
+      ],
+      "speculative.n_max": 16,
+      "speculative.n_min": 0,
+      "speculative.p_min": 0.75,
+      "timings_per_token": false,
+      "post_sampling_probs": false,
+      "lora": []
+    },
+    "next_token": {
+      "has_next_token": true,
+      "has_new_line": false,
+      "n_remain": -1,
+      "n_decoded": 0
+    }
+  },
+  {
+    "id": 1,
+    "id_task": 0,
+    "n_ctx": 65536,
+    "speculative": false,
+    "is_processing": true,
+    "params": {
+      "n_predict": -1,
+      "seed": 4294967295,
+      "temperature": 0.800000011920929,
+      "dynatemp_range": 0.0,
+      "dynatemp_exponent": 1.0,
+      "top_k": 40,
+      "top_p": 0.949999988079071,
+      "min_p": 0.05000000074505806,
+      "top_n_sigma": -1.0,
+      "xtc_probability": 0.0,
+      "xtc_threshold": 0.10000000149011612,
+      "typical_p": 1.0,
+      "repeat_last_n": 64,
+      "repeat_penalty": 1.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "dry_multiplier": 0.0,
+      "dry_base": 1.75,
+      "dry_allowed_length": 2,
+      "dry_penalty_last_n": 131072,
+      "mirostat": 0,
+      "mirostat_tau": 5.0,
+      "mirostat_eta": 0.10000000149011612,
+      "max_tokens": -1,
+      "n_keep": 0,
+      "n_discard": 0,
+      "ignore_eos": false,
+      "stream": true,
+      "n_probs": 0,
+      "min_keep": 0,
+      "chat_format": "GPT-OSS",
+      "reasoning_format": "none",
+      "reasoning_in_content": false,
+      "generation_prompt": "",
+      "samplers": [
+        "penalties",
+        "dry",
+        "top_k",
+        "typ_p",
+        "top_p",
+        "min_p",
+        "xtc",
+        "temperature"
+      ],
+      "speculative.n_max": 16,
+      "speculative.n_min": 0,
+      "speculative.p_min": 0.75,
+      "timings_per_token": false,
+      "post_sampling_probs": false,
+      "lora": []
+    },
+    "next_token": {
+      "has_next_token": true,
+      "has_new_line": true,
+      "n_remain": -1,
+      "n_decoded": 136
+    }
+  }
+]
+```
+
+</details>
+
+### GET `/metrics`: Prometheus compatible metrics exporter
+
+This endpoint is only accessible if `--metrics` is set.
+
+In *router mode* the query param `?model={model_id}` has to be set. This endpoint will respond with status code 400 `model name is missing from the request` if not set.
+
+#### Available metrics
+
+| Metric | Type | Description |
+| ------ | ---------------------- | ----------- |
+| `llamacpp:prompt_tokens_total` | Counter | Number of prompt tokens processed. |
+| `llamacpp:prompt_seconds_total` | Counter | Prompt process time in secon
+
+Résumé détaillé et structuré du texte ci-dessus, en français :

@@ -1,0 +1,29 @@
+From 9091e2798383e662369ee3f99d20b8a7d66c7d0e Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Tue, 15 Sep 2026 14:22:37 +0000
+Subject: [PATCH 03/16] v620-pp3: skip the final HC mixer weights on non-last
+ pipeline stages
+
+---
+ vllm/models/qwen4_exp/amd/model.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/amd/model.py b/vllm/models/qwen4_exp/amd/model.py
+index 6ae871ff3f..fdbfc549b0 100644
+--- a/vllm/models/qwen4_exp/amd/model.py
++++ b/vllm/models/qwen4_exp/amd/model.py
+@@ -636,8 +636,11 @@ class Qwen4ExpModel(nn.Module):
+         mapper = self.hf_to_vllm_mapper | WeightsMapper(
+             orig_to_new_substr={substr: None for substr in skip_substrs}
+         )
++        # v620-pp3: the final mixer only exists on the last pipeline stage
++        skip_prefixes = [] if get_pp_group().is_last_rank else ["hyper_connection_mixer."]
+         loader = AutoWeightsLoader(
+             self,
++            skip_prefixes=skip_prefixes,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+         loaded = loader.load_weights(
+-- 
+2.43.0
+

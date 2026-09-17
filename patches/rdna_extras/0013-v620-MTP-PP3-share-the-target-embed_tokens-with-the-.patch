@@ -1,0 +1,36 @@
+From 10930ad4b712d80d53283f819dac29c16b8948a4 Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Thu, 17 Sep 2026 15:45:26 +0000
+Subject: [PATCH 13/16] v620 MTP PP3: share the target embed_tokens with the
+ drafter under PP as well (CPU placeholder otherwise)
+
+---
+ vllm/v1/spec_decode/llm_base_proposer.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 15ced435c7..78c1008f73 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -5,6 +5,7 @@ from importlib.util import find_spec
+ from typing import TYPE_CHECKING, Any, cast
+ 
+ import numpy as np
++import os
+ import torch
+ import torch.nn as nn
+ 
+@@ -1442,7 +1443,9 @@ class SpecDecodeBaseProposer:
+         we share the target model's embedding layers with the draft model to save
+         memory.
+         """
+-        if get_pp_group().world_size == 1:
++        # v620-pp3: under PP every stage keeps embed_tokens (Qwen4Exp), so share on
++        # the drafter s rank too instead of leaving the CPU placeholder in place.
++        if get_pp_group().world_size == 1 or os.environ.get("V620_SHARE_EMBED_PP", "1") == "1":
+             inner_model = getattr(target_language_model, "model", None)
+             if inner_model is None:
+                 raise AttributeError("Target model does not have 'model' attribute")
+-- 
+2.43.0
+

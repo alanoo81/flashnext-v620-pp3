@@ -1,0 +1,32 @@
+From 51d3eba55b8a3d30ef4545e795be0e3be03d496d Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Thu, 17 Sep 2026 16:36:34 +0000
+Subject: [PATCH 16/16] v620 MTP (V1 runner): allow FlashAttentionMetadata
+ (Qwen4Exp QSA) for multi-step drafting on ROCm
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vugn8vGjCf8fVWViDZHdko
+---
+ vllm/v1/spec_decode/llm_base_proposer.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index b6d47da46e..25a1a9e065 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -322,6 +322,12 @@ class SpecDecodeBaseProposer:
+ 
+             rocm_types.append(FlexAttentionMetadata)
+ 
++            # v620: Qwen4Exp QSA metadata derives from FlashAttentionMetadata (RDNA2
++            # FA port); the generic multi-step update handles it as on CUDA.
++            if os.environ.get("V620_MTP_ALLOW_FA_META", "1") == "1":
++                from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
++                rocm_types.append(FlashAttentionMetadata)
++
+             self.allowed_attn_types = tuple(rocm_types)
+ 
+     def _raise_if_padded_drafter_batch_disabled(self):
+-- 
+2.43.0
+

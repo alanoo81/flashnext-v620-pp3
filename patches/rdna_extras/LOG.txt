@@ -1,0 +1,16 @@
+51d3eba55b 2026-09-17 v620 MTP (V1 runner): allow FlashAttentionMetadata (Qwen4Exp QSA) for multi-step drafting on ROCm
+a15d31fe6b 2026-09-17 v620 MTP: causal_conv1d rdna2 kernels only when state_len == width-1 (spec decode widens the conv state)
+876ff5e036 2026-09-17 v620 MTP: route draft hidden width through _get_hidden_size() so Qwen4ExpMTPProposer can widen it to hc_mult streams
+10930ad4b7 2026-09-17 v620 MTP PP3: share the target embed_tokens with the drafter under PP as well (CPU placeholder otherwise)
+e83a8510bc 2026-09-17 v620 MTP: image_token_index fallback for Qwen4Exp in the drafter loader
+9cc58b311f 2026-09-17 v620 MTP: tolerate missing _v620_mark instrumentation in the PLE connector
+c21e763026 2026-09-17 v620 MTP PP3: port the 15 Sept leapdragon-tree MTP patches (drafter CPU placeholders for embed/lm_head, shared embedding under PP, blockwise int8 shadows, draft head embeds on last stage, PLE connector under PP) onto rdna_extras 50120e1
+739d454629 2026-09-16 v620: diagnostics — V620_RMS_C=1 forces _C rms norms (no HIP gated norm), V620_DUMP layer hooks
+9c109fcc0d 2026-09-16 v620: pass w2_zp to try_rocm_moe_skinny_decode at the call sites that omitted it (moe_wna16/AutoRound path)
+a000fafe63 2026-09-15 v620: diagnostic env gates to force Triton GDN prefill / Triton WNA16 MoE on gfx1030
+05b5278f6c 2026-09-15 v620-pp3: lift the PP guard in gpu_model_runner (PLE on stage 0)
+ad7c4ed74e 2026-09-15 v620-pp3: PLE offload worker ignores VLLM_PP_LAYER_PARTITION
+27387b922c 2026-09-15 v620-pp3: use ignore_unexpected_prefixes for the final mixer
+9091e27983 2026-09-15 v620-pp3: skip the final HC mixer weights on non-last pipeline stages
+85177923c9 2026-09-15 v620-pp3: fix PleOffloadLayer import
+3a919d115c 2026-09-15 v620: allow pipeline parallelism with the PLE layer on stage 0 (PP3 on 3x V620)

@@ -1,0 +1,1305 @@
+--- /dev/null	2026-09-16 19:12:35.406682331 +0000
++++ b/vllm/model_executor/layers/fused_moe/configs/E=512,N=640,device_name=AMD_Radeon_Pro_V620,dtype=int4_w4a16.json	2026-09-17 18:09:14.804121829 +0000
+@@ -0,0 +1,83 @@
++{
++ "1": {
++  "BLOCK_SIZE_M": 1,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "2": {
++  "BLOCK_SIZE_M": 2,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "4": {
++  "BLOCK_SIZE_M": 4,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "8": {
++  "BLOCK_SIZE_M": 8,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "16": {
++  "BLOCK_SIZE_M": 16,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "32": {
++  "BLOCK_SIZE_M": 16,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "64": {
++  "BLOCK_SIZE_M": 16,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "128": {
++  "BLOCK_SIZE_M": 64,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "256": {
++  "BLOCK_SIZE_M": 64,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1
++ },
++ "512": {
++  "BLOCK_SIZE_M": 64,
++  "BLOCK_SIZE_N": 64,
++  "BLOCK_SIZE_K": 32,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1,
++  "num_warps": 4,
++  "num_stages": 1
++ },
++ "1024": {
++  "BLOCK_SIZE_M": 64,
++  "BLOCK_SIZE_N": 64,
++  "BLOCK_SIZE_K": 32,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1,
++  "num_warps": 4,
++  "num_stages": 1
++ },
++ "2048": {
++  "BLOCK_SIZE_M": 64,
++  "BLOCK_SIZE_N": 64,
++  "BLOCK_SIZE_K": 32,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1,
++  "num_warps": 4,
++  "num_stages": 1
++ },
++ "4096": {
++  "BLOCK_SIZE_M": 64,
++  "BLOCK_SIZE_N": 64,
++  "BLOCK_SIZE_K": 32,
++  "GROUP_SIZE_M": 1,
++  "SPLIT_K": 1,
++  "num_warps": 4,
++  "num_stages": 1
++ }
++}
+\ No newline at end of file
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py	2026-09-17 18:25:06.314392733 +0000
+@@ -210,6 +210,7 @@
+         return quant_method.__class__.__name__ in (
+             "AutoGPTQMoEMethod",
+             "CompressedTensorsWNA16MoEMethod",
++            "CompressedTensorsWNA16RDNA2MoEMethod",  # v620-pp3
+             "CompressedTensorsW4A16FlydslMoEMethod",
+         )
+ 
+@@ -657,6 +658,7 @@
+         if quant_method_name in (
+             "CompressedTensorsWNA16MoEMethod",
+             "CompressedTensorsWNA16RDNA3MoEMethod",
++            "CompressedTensorsWNA16RDNA2MoEMethod",  # v620-pp3
+             "CompressedTensorsW4A16FlydslMoEMethod",
+         ):
+             if is_transposed:
+--- a/vllm/model_executor/layers/ple_offload_layer.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/model_executor/layers/ple_offload_layer.py	2026-09-15 19:43:38.571213775 +0000
+@@ -23,6 +23,15 @@
+ from typing import Any, cast
+ 
+ import torch
++import os as _v620_os, sys as _v620_sys, time as _v620_time
++_V620_TRACE = _v620_os.environ.get("V620_PLE_TRACE") == "1"
++_v620_events: dict = {}
++def _v620_mark(name):
++    if _V620_TRACE:
++        ev = torch.cuda.Event(); ev.record(torch.cuda.current_stream()); _v620_events[name] = ev
++def _v620_log(msg):
++    if _V620_TRACE:
++        _v620_sys.stderr.write("[V620-PLE %.3f] %s\n" % (_v620_time.time() % 1000, msg)); _v620_sys.stderr.flush()
+ from torch import nn
+ 
+ # cuda-python is an NVIDIA-only package. The stream write/wait-value and host
+@@ -165,6 +174,7 @@
+ ) -> None:
+     """Wait for the CPU result without releasing its output buffer."""
+     stream = torch.cuda.current_stream()
++    _v620_log(f"layer WAIT(flag==DONE) stream={stream.cuda_stream:#x} ntok={hidden_states.shape[0]}")
+     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
+     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())
+     _cuda_check(
+@@ -282,4 +292,5 @@
+     ) -> None:
+         """Mark the cross-process output buffer reusable on ``stream``."""
+         if self._is_cpu_offloaded:
++            _v620_log(f"layer RESET(flag=0) stream={(stream or torch.cuda.current_stream()).cuda_stream:#x}")
+             self._sem.reset(stream)
+--- /dev/null	2026-09-16 19:12:35.406682331 +0000
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_rdna2.py	2026-09-17 18:22:04.380597869 +0000
+@@ -0,0 +1,301 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CompressedTensors MoE W4A16 using the fused RDNA2 (gfx1030) HIP kernel.
++
++Uses ``moe_gptq_gemm_rdna2`` — a single HIP kernel launch per GEMM that
++handles expert routing + W4A16 dequant + dot product with atomic output.
++
++Weight format (per expert, same as dense RDNA2 W4A16):
++  - Packed int32 ``[E, K/8, N]`` with exllama shuffle
++  - Scales ``[E, groups, N]`` in activation dtype
++  - Zero points ``[E, groups, N/8]`` packed int32 (synthesized)
++"""
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe import (
++    RoutedExperts,
++    SharedExperts,
++)
++from vllm.model_executor.layers.fused_moe.activation import (
++    MoEActivation,
++    apply_moe_activation,
++)
++from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
++    moe_align_block_size,
++)
++from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (  # noqa: E501
++    CompressedTensorsWNA16MoEMethod,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    pack_quantized_values_into_int32,
++)
++from vllm.scalar_type import scalar_types
++
++logger = init_logger(__name__)
++
++# v620-pp3: the HIP kernel comes from opengfx1030/vllm-rdna (csrc/rocm/moe_q_gemm_rdna2.cu),
++# built as a standalone torch extension (rdna2-moe/ in the overlay) and loaded here under
++# the `_v620_rdna2` op namespace. V620_MOE_SO overrides the library path.
++import os as _os
++
++_V620_SO = _os.environ.get("V620_MOE_SO", "/app/vllm/vllm/v620_moe_rdna2.so")
++if not hasattr(torch.ops, "_v620_rdna2") or not hasattr(
++    torch.ops._v620_rdna2, "moe_gptq_gemm_rdna2"
++):
++    torch.ops.load_library(_V620_SO)
++
++
++def _moe_gptq_gemm_rdna2(
++    a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
++    expert_ids, num_tokens_post_padded, top_k, block_size_m, mul_topk_weight,
++    output_topk=0,
++):
++    # schema dispatch expects fp32 topk_weights (the kernel reads float*)
++    if topk_weights.dtype != torch.float32:
++        topk_weights = topk_weights.float()
++    torch.ops._v620_rdna2.moe_gptq_gemm_rdna2(
++        a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
++        expert_ids, num_tokens_post_padded, top_k, block_size_m,
++        mul_topk_weight, output_topk,
++    )
++
++
++
++def _synthesize_qzeros(
++    groups: int, out_features: int, device: torch.device
++) -> torch.Tensor:
++    """Create packed zero-point tensor for symmetric quant.
++
++    GPTQv1 +1 quirk: kernel adds 1 to stored zeros, so encode
++    (bias - 1) = 7 for uint4b8 (bias=8).
++    """
++    zeros = torch.full(
++        (groups, out_features),
++        scalar_types.uint4b8.bias - 1,
++        dtype=torch.int32,
++        device=device,
++    )
++    return pack_quantized_values_into_int32(zeros, scalar_types.uint4b8, packed_dim=1)
++
++
++class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
++    """W4A16 MoE using the fused RDNA2 HIP kernel (moe_gptq_gemm_rdna2).
++
++    Weights are in RDNA2 format (shuffled int32 [E, K/8, N]),
++    NOT Triton format (transposed uint8). apply() dispatches through
++    the fused HIP kernel directly.
++    """
++
++    def create_weights(self, layer, num_experts, hidden_size,
++                       intermediate_size_per_partition, params_dtype,
++                       **extra_weight_attrs):
++        # v620-pp3: leapdragon's RoutedExperts passes intermediate_size_full only to an
++        # exact class-name list (rdna_extras walks the MRO); supply it ourselves.
++        extra_weight_attrs.setdefault(
++            "intermediate_size_full", layer.moe_config.intermediate_size
++        )
++        return super().create_weights(
++            layer, num_experts, hidden_size, intermediate_size_per_partition,
++            params_dtype, **extra_weight_attrs,
++        )
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        device = layer.w13_weight_packed.device
++        num_experts = layer.w13_weight_packed.shape[0]
++        empty_g_idx = torch.empty(0, dtype=torch.int32, device=device)
++
++        # Shuffle weights in-place per expert (exllama nibble interleave)
++        for e in range(num_experts):
++            w13_e = layer.w13_weight_packed.data[e].contiguous()
++            ops.gptq_shuffle(w13_e, empty_g_idx, 4)
++            layer.w13_weight_packed.data[e] = w13_e
++            w2_e = layer.w2_weight_packed.data[e].contiguous()
++            ops.gptq_shuffle(w2_e, empty_g_idx, 4)
++            layer.w2_weight_packed.data[e] = w2_e
++
++        # Keep scales as [E, groups, N] in activation dtype
++        act_dtype = layer.w13_weight_scale.dtype
++        layer.w13_weight_scale = torch.nn.Parameter(
++            layer.w13_weight_scale.to(dtype=act_dtype).contiguous(),
++            requires_grad=False,
++        )
++        layer.w2_weight_scale = torch.nn.Parameter(
++            layer.w2_weight_scale.to(dtype=act_dtype).contiguous(),
++            requires_grad=False,
++        )
++
++        # Synthesize packed zero points: [E, groups, N/8] int32
++        w13_groups = (layer.w13_weight_packed.shape[1] * 8) // self.group_size
++        w13_N = layer.w13_weight_packed.shape[2]
++        w2_groups = (layer.w2_weight_packed.shape[1] * 8) // self.group_size
++        w2_N = layer.w2_weight_packed.shape[2]
++
++        w13_qz = _synthesize_qzeros(w13_groups, w13_N, device)
++        w2_qz = _synthesize_qzeros(w2_groups, w2_N, device)
++        layer.w13_qzeros = torch.nn.Parameter(
++            w13_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
++            requires_grad=False,
++        )
++        layer.w2_qzeros = torch.nn.Parameter(
++            w2_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
++            requires_grad=False,
++        )
++
++        # Pre-allocate reusable buffers for decode (sizes based on top_k=8)
++        N_gate_up = w13_N
++        hidden_size = w2_N
++        intermediate = N_gate_up // 2  # gated activation
++        # Max tokens we expect in decode; prefill will re-allocate if needed
++        max_decode_tokens = 16
++        top_k = 8  # conservative default
++        buf_size = max_decode_tokens * top_k
++        layer.rdna2_w1_buf = torch.zeros(
++            buf_size, N_gate_up, dtype=act_dtype, device=device
++        )
++        layer.rdna2_act_buf = torch.empty(
++            buf_size, intermediate, dtype=act_dtype, device=device
++        )
++        layer.rdna2_out_buf = torch.zeros(
++            max_decode_tokens, hidden_size, dtype=act_dtype, device=device
++        )
++        layer.rdna2_empty_tw = torch.empty(0, device=device)
++
++    def apply(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
++        shared_experts_input: torch.Tensor | None,
++    ) -> torch.Tensor:
++        activation = (
++            layer.activation
++            if isinstance(layer.activation, MoEActivation)
++            else MoEActivation.from_str(layer.activation)
++        )
++        return _rdna2_fused_moe(
++            x,
++            topk_weights,
++            topk_ids,
++            layer=layer,
++            activation=activation,
++            apply_router_weight_on_input=(layer.apply_router_weight_on_input),
++            global_num_experts=layer.global_num_experts,
++            expert_map=layer.expert_map,
++        )
++
++
++def _rdna2_fused_moe(
++    hidden_states: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    layer: RoutedExperts,
++    activation: MoEActivation,
++    apply_router_weight_on_input: bool,
++    global_num_experts: int,
++    expert_map: torch.Tensor | None,
++) -> torch.Tensor:
++    """Fused MoE forward using the RDNA2 W4A16 HIP kernel.
++
++    Optimizations vs naive dispatch:
++      - BLOCK_SIZE_M=1 for decode (no padding waste, bf16 fast path)
++      - Pre-allocated buffers (no torch.zeros per call)
++      - Inline token sorting for small M (skip moe_align_block_size)
++      - moe_sum fused into output accumulation
++    """
++    num_tokens = hidden_states.shape[0]
++    top_k = topk_ids.shape[1]
++    total_tokens = num_tokens * top_k
++    N_gate_up = layer.w13_weight_packed.shape[2]
++    hidden_size = layer.w2_weight_packed.shape[2]
++    dtype = hidden_states.dtype
++    device = hidden_states.device
++
++    intermediate_size = N_gate_up // 2 if activation.is_gated else N_gate_up
++
++    if global_num_experts <= 0:
++        global_num_experts = layer.w13_weight_packed.shape[0]
++
++    # BLOCK_SIZE_M=1 for decode (small M), 4 for prefill
++    block_size_m = 1 if num_tokens <= 4 else 4
++
++    # --- Token routing ---
++    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
++        topk_ids,
++        block_size_m,
++        global_num_experts,
++        expert_map,
++    )
++
++    # --- Reuse pre-allocated buffers when possible ---
++    if total_tokens <= layer.rdna2_w1_buf.shape[0]:
++        w1_out = layer.rdna2_w1_buf[:total_tokens]
++        w1_out.zero_()
++        act_out = layer.rdna2_act_buf[:total_tokens]
++    else:
++        w1_out = torch.zeros(
++            total_tokens,
++            N_gate_up,
++            dtype=dtype,
++            device=device,
++        )
++        act_out = torch.empty(
++            total_tokens,
++            intermediate_size,
++            dtype=dtype,
++            device=device,
++        )
++
++    # --- topk weights (pre-cast to float32 for kernel) ---
++    topk_w_float = topk_weights.view(-1).float()
++    empty_tw = layer.rdna2_empty_tw
++
++    # --- w1 GEMM: [M, K] -> [M*top_k, N_gate_up] ---
++    _moe_gptq_gemm_rdna2(
++        hidden_states,
++        w1_out,
++        layer.w13_weight_packed,
++        layer.w13_weight_scale,
++        layer.w13_qzeros,
++        topk_w_float if apply_router_weight_on_input else empty_tw,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        top_k,
++        block_size_m,
++        apply_router_weight_on_input,
++    )
++
++    # --- Activation (silu_and_mul etc.) ---
++    apply_moe_activation(activation, act_out, w1_out)
++
++    # --- w2 GEMM: [M*top_k, intermediate] -> [M, hidden] (fused reduce) ---
++    # output_topk=top_k: kernel writes to out[token_id / top_k] directly,
++    # fusing moe_sum into the atomic accumulation — saves one kernel launch
++    # and the w2_out intermediate buffer.
++    out = torch.zeros(
++        num_tokens,
++        hidden_size,
++        dtype=dtype,
++        device=device,
++    )
++    _moe_gptq_gemm_rdna2(
++        act_out,
++        out,
++        layer.w2_weight_packed,
++        layer.w2_weight_scale,
++        layer.w2_qzeros,
++        topk_w_float if not apply_router_weight_on_input else empty_tw,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        1,
++        block_size_m,
++        not apply_router_weight_on_input,
++        output_topk=top_k,
++    )
++    return out
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/rocm_moe_rdna.py	2026-08-29 23:19:12.000000000 +0000
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/rocm_moe_rdna.py	2026-09-17 18:22:04.380756889 +0000
+@@ -13,12 +13,37 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _v620_rdna2_available() -> bool:
++    """v620-pp3: fused W4A16 MoE HIP kernel for gfx1030 (V620_MOE_HIP=0 disables)."""
++    import os
++
++    if os.environ.get("V620_MOE_HIP", "1") != "1":
++        return False
++    if hasattr(torch.ops, "_v620_rdna2") and hasattr(
++        torch.ops._v620_rdna2, "moe_gptq_gemm_rdna2"
++    ):
++        return True
++    so = os.environ.get("V620_MOE_SO", "/app/vllm/vllm/v620_moe_rdna2.so")
++    if not os.path.exists(so):
++        return False
++    try:
++        torch.ops.load_library(so)
++    except Exception as exc:  # noqa: BLE001
++        logger.warning_once("v620: cannot load %s: %s", so, exc)
++        return False
++    return hasattr(torch.ops._v620_rdna2, "moe_gptq_gemm_rdna2")
++
++
+ def is_supported(weight_quant) -> bool:
+     """Check if a native ROCm MoE kernel is available for this config."""
+     if weight_quant.num_bits != 4:
+         return False
+ 
+-    from vllm.platforms.rocm import on_gfx1100
++    from vllm.platforms.rocm import on_gfx10x, on_gfx1100
++
++    # v620-pp3: RDNA2 (gfx1030) via the standalone extension (see _v620_rdna2_available)
++    if on_gfx10x() and _v620_rdna2_available():
++        return True
+ 
+     # RDNA3 (gfx1100). Future: add RDNA4 (gfx12x), CDNA (gfx94x), etc.
+     return (
+@@ -30,8 +55,19 @@
+ 
+ def make_method(weight_quant, input_quant, moe_config):
+     """Create the native ROCm MoE method. Call only after is_supported()."""
+-    from vllm.platforms.rocm import on_gfx1100
++    from vllm.platforms.rocm import on_gfx10x, on_gfx1100
+ 
++    if on_gfx10x() and _v620_rdna2_available():
++        from .compressed_tensors_moe_wna16_rdna2 import (
++            CompressedTensorsWNA16RDNA2MoEMethod,
++        )
++        logger.info_once(
++            "Using CompressedTensorsWNA16RDNA2MoEMethod (native gfx1030 HIP kernel "
++            "moe_gptq_gemm_rdna2, v620 port from opengfx1030/vllm-rdna)"
++        )
++        return CompressedTensorsWNA16RDNA2MoEMethod(
++            weight_quant, input_quant, moe_config
++        )
+     if on_gfx1100():
+         from .compressed_tensors_moe_wna16_rdna3 import (
+             CompressedTensorsWNA16RDNA3MoEMethod,
+--- a/vllm/model_executor/layers/rdna_dense_int8.py	2026-09-07 03:47:33.000000000 +0000
++++ b/vllm/model_executor/layers/rdna_dense_int8.py	2026-09-15 18:42:52.536950241 +0000
+@@ -132,10 +132,19 @@
+     n, k = w.shape
+     if k % 16 != 0 or n < int(os.getenv("VLLM_RDNA_DENSE_INT8_MIN_ROWS", "64")):
+         return
+-    amax = w.abs().amax(dim=1).float().clamp_min(1e-8)
+-    scale = (amax / 127.0)
+-    q = torch.round(w.float() / scale[:, None]).clamp_(-127, 127).to(torch.int8)
+-    layer.weight_i8 = q.contiguous()
++    # v620: quantise in row blocks so the fp32 temporaries stay small (the 248320-row
++    # embedding otherwise needs a 2.4 GiB fp32 copy on a card that has <1 GiB left)
++    q = torch.empty((n, k), dtype=torch.int8, device=w.device)
++    scale = torch.empty((n,), dtype=torch.float32, device=w.device)
++    step = max(1, (64 << 20) // (k * 4))
++    for r0 in range(0, n, step):
++        blk = w[r0:r0 + step].float()
++        amax = blk.abs().amax(dim=1).clamp_min(1e-8)
++        sc = amax / 127.0
++        scale[r0:r0 + step] = sc
++        q[r0:r0 + step] = torch.round(blk / sc[:, None]).clamp_(-127, 127).to(torch.int8)
++        del blk
++    layer.weight_i8 = q
+     layer.weight_i8_scale = scale.to(torch.float16).contiguous()
+     if only_mode():
+         # Release the fp16 copy: keep the Parameter object (loader attrs, registration)
+--- a/vllm/model_executor/model_loader/base_loader.py	2026-08-29 23:19:12.000000000 +0000
++++ b/vllm/model_executor/model_loader/base_loader.py	2026-09-16 21:50:51.776108551 +0000
+@@ -79,6 +79,10 @@
+ 
+             process_weights_after_loading(model, model_config, target_device)
+ 
++        import os as _os
++        if _os.environ.get("V620_DUMP"):
++            from v620_dump import install as _v620_install
++            _v620_install(model)
+         return model.eval()
+ 
+ 
+--- a/vllm/models/qwen4_exp/amd/model.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/models/qwen4_exp/amd/model.py	2026-09-15 14:23:04.712464296 +0000
+@@ -581,8 +581,11 @@
+         mapper = self.hf_to_vllm_mapper | WeightsMapper(
+             orig_to_new_substr={substr: None for substr in skip_substrs}
+         )
++        # v620-pp3: the final mixer only exists on the last pipeline stage
++        pp_ignored = [] if get_pp_group().is_last_rank else ["hyper_connection_mixer."]
+         loader = AutoWeightsLoader(
+             self,
++            ignore_unexpected_prefixes=pp_ignored,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+         loaded = loader.load_weights(
+--- a/vllm/models/qwen4_exp/amd/model_state.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/models/qwen4_exp/amd/model_state.py	2026-09-15 14:15:13.950345774 +0000
+@@ -32,13 +32,9 @@
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++        # PP > 1: every rank builds input_ids/ngram_context for its own batch, and
++
++        # only the stage that holds a PLE layer consumes them (v620-pp3).
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+--- a/vllm/models/qwen4_exp/amd/mtp.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/models/qwen4_exp/amd/mtp.py	2026-09-15 18:51:37.670591564 +0000
+@@ -174,7 +174,11 @@
+         self.hidden_size = config.hidden_size
+         self.hc_count = config.hc_count
+ 
+-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
++        # v620-pp3: the draft borrows the target embedding after loading (see
++        # spec_decode/eagle/utils.py), so build the placeholder on the CPU and keep the
++        # 1.3 GB out of the last pipeline stage VRAM.
++        with torch.device("cpu"):
++            self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+         draft_vllm_config = _make_draft_vllm_config(
+             vllm_config,
+             self.mtp_start_layer_idx,
+@@ -281,7 +285,9 @@
+         hc_count = self.hc_count
+         hidden_size = self.hidden_size
+ 
+-        if get_pp_group().is_first_rank:
++        # v620-pp3: the draft head runs whole on the rank that hosts the speculator (the
++        # last pipeline stage), so it embeds its own inputs there too.
++        if get_pp_group().is_first_rank or get_pp_group().is_last_rank:
+             assert hidden_states is not None
+             if inputs_embeds is None:
+                 assert input_ids is not None
+@@ -401,11 +407,13 @@
+             if config.tie_word_embeddings:
+                 self.lm_head = self.model.embed_tokens
+             else:
+-                self.lm_head = ParallelLMHead(
+-                    config.vocab_size,
+-                    config.hidden_size,
+-                    prefix=maybe_prefix(prefix, "lm_head"),
+-                )
++                # v620-pp3: shared with the target lm_head after loading; CPU placeholder
++                with torch.device("cpu"):
++                    self.lm_head = ParallelLMHead(
++                        config.vocab_size,
++                        config.hidden_size,
++                        prefix=maybe_prefix(prefix, "lm_head"),
++                    )
+         else:
+             self.lm_head = PPMissingLayer()
+ 
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py	2026-09-15 14:15:13.950540772 +0000
+@@ -32,13 +32,9 @@
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++        # PP > 1: every rank builds input_ids/ngram_context for its own batch, and
++
++        # only the stage that holds a PLE layer consumes them (v620-pp3).
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+--- a/vllm/v1/ple_offload/connector.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/v1/ple_offload/connector.py	2026-09-15 19:48:00.600616002 +0000
+@@ -3,6 +3,12 @@
+ """Exchange PLE data between a GPU worker and the CPU-offload process."""
+ 
+ import os
++_V620_TRACE = os.environ.get("V620_PLE_TRACE") == "1"
++from vllm.model_executor.layers.ple_offload_layer import _v620_mark
++def _v620_log(msg):
++    if _V620_TRACE:
++        import sys, time as _t
++        sys.stderr.write("[V620-PLE %.3f] %s\n" % (_t.time() % 1000, msg)); sys.stderr.flush()
+ import queue
+ import threading
+ import time
+@@ -419,6 +425,7 @@
+         with torch.accelerator.device_index(self.device.index):
+             with torch.cuda.stream(self._d2h_stream):
+                 self._d2h_stream.wait_event(input_ready)
++                _v620_mark("d2h_after_wait")
+                 with torch.cuda.nvtx.range("ple_offload.copy_input_ids"):
+                     self._input_ids_buf[: request.num_tokens].copy_(
+                         self._input_ids_source[: request.num_tokens],
+@@ -436,6 +443,7 @@
+                             self._ngram_context_source[: request.num_reqs],
+                             non_blocking=True,
+                         )
++                _v620_mark("d2h_after_copies")
+                 self._d2h_done_event.record(self._d2h_stream)
+             if not wait:
+                 return
+@@ -491,6 +499,7 @@
+         dummy_run: bool,
+     ) -> None:
+         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
++        _v620_log(f"prepare_forward tp{self.tp_rank} dummy={dummy_run} reqs={num_reqs} toks={num_tokens} seq={self._launch_seq + (0 if dummy_run else 1)} stream={torch.cuda.current_stream(self.device).cuda_stream:#x}")
+         if dummy_run:
+             self.signal_dummy_outputs(num_tokens)
+             return
+@@ -512,7 +521,9 @@
+         # lost a GPU on this machine. Waiting here on the host costs nothing:
+         # step N+1's lookup needs step N's sampled token, so the chain is serial
+         # anyway, and async scheduling still overlaps this wait with forward N.
++        _v620_log(f"launch done seq={self._launch_seq}, waiting lookup")
+         self._wait_lookup_done(self._launch_seq, num_tokens, spin_now=inline and self.tp_rank == 0)
++        _v620_log(f"lookup done seq={self._launch_seq}, signalling")
+         t_seen_ns = time.perf_counter_ns() if _HOPS else 0
+         # The result is in the shared pinned buffer: copy it to our device buffer on the
+         # model stream (stream-ordered before the forward) and raise the flag the eager
+@@ -559,7 +570,23 @@
+         if num_tokens > 8:
+             spin_after = 3600.0
+         n = 0
++        _v620_t0 = time.perf_counter(); _v620_warned = False
+         while not ev.query():
++            if _V620_TRACE and not _v620_warned and time.perf_counter() - _v620_t0 > 5.0:
++                _v620_warned = True
++                try:
++                    side = torch.cuda.Stream(device=self.device)
++                    with torch.cuda.stream(side):
++                        host = torch.empty(1, dtype=torch.int32, pin_memory=True)
++                        host.copy_(next(iter(self._layers.values()))._sem.flag_tensor, non_blocking=True)
++                    side.synchronize()
++                    flag = int(host.item())
++                except Exception as e:
++                    flag = f"err {e}"
++                from vllm.model_executor.layers import ple_offload_layer as _pol
++                evs = {k: v.query() for k, v in _pol._v620_events.items()}
++                evs["input_ready"] = input_ready.query()
++                _v620_log(f"D2H event not done after 5 s (seq={self._launch_seq}, toks={num_tokens}); sem flag={flag}; model-stream events done: {evs}")
+             now = time.perf_counter()
+             if now - t0 < spin_after:
+                 time.sleep(100e-6)
+@@ -659,6 +686,7 @@
+         for layer in self._layers.values():
+             layer._gpu_output_buffer[:num_tokens].zero_()
+             layer._sem.signal(stream)
++        _v620_log(f"signal_dummy toks={num_tokens} stream={stream.cuda_stream:#x}")
+ 
+     def release_outputs(self) -> None:
+         """Mark GPU output buffers reusable after the model consumes them."""
+@@ -667,6 +695,7 @@
+         stream = torch.cuda.current_stream(self.device)
+         for layer in self._layers.values():
+             layer.release_offloaded_output(stream)
++        _v620_mark("after_reset")
+ 
+     def close(self) -> None:
+         """Stop request transport and release host registrations."""
+--- a/vllm/v1/ple_offload/worker.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/v1/ple_offload/worker.py	2026-09-15 15:08:39.570304729 +0000
+@@ -256,6 +256,9 @@
+         death_pipe: Connection,
+     ) -> None:
+         """Load PLE weights, accept registrations, and run the request loop."""
++        # v620-pp3: the offload worker rebuilds the model with pp_size=1; a pipeline layer
++        # partition meant for the GPU ranks must not apply here.
++        os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+         decorate_logs("PleOffloadWorker")
+         ready_reader, ready_writer = ready_pipe
+         ready_reader.close()
+--- a/vllm/v1/spec_decode/llm_base_proposer.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/v1/spec_decode/llm_base_proposer.py	2026-09-15 20:56:29.016574673 +0000
+@@ -300,11 +300,14 @@
+             if find_spec(
+                 AttentionBackendEnum.ROCM_AITER_FA.get_path(include_classname=False)
+             ):
+-                from vllm.v1.attention.backends.rocm_aiter_fa import (
+-                    AiterFlashAttentionMetadata,
+-                )
+-
+-                rocm_types.append(AiterFlashAttentionMetadata)
++                try:  # v620-pp3: the image has no aiter (RDNA2)
++                    from vllm.v1.attention.backends.rocm_aiter_fa import (
++                        AiterFlashAttentionMetadata,
++                    )
++                except ImportError:
++                    AiterFlashAttentionMetadata = None
++                if AiterFlashAttentionMetadata is not None:
++                    rocm_types.append(AiterFlashAttentionMetadata)
+ 
+             # TRITON_MLA backend support for MLA models (e.g., DeepSeek)
+             from vllm.model_executor.layers.attention.mla_attention import (
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py	2026-08-29 23:19:12.000000000 +0000
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py	2026-09-17 12:20:26.129087863 +0000
+@@ -864,6 +864,14 @@
+     torch.accelerator.synchronize()
+     if hasattr(runner.model_state, "_mamba_ctx"):
+         runner.model_state._mamba_ctx = None
++    # Invalidate the align-mode Mamba group metadata cached from the
++    # profiling KVCacheConfig: the real (e.g. PP-projected) config may
++    # place Mamba layers into a different group layout, so it must be
++    # re-derived from the real config.
++    if hasattr(runner.model_state, "_mamba_group_ids"):
++        runner.model_state._mamba_group_ids = []
++    if hasattr(runner.model_state, "_mamba_spec"):
++        runner.model_state._mamba_spec = None
+     if hasattr(runner, "kv_caches"):
+         runner.kv_caches.clear()
+     if hasattr(runner, "attn_groups"):
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-09-15 16:12:14.000000000 +0000
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-09-17 11:14:19.836097824 +0000
+@@ -26,10 +26,15 @@
+ 
+ import numpy as np
+ import torch
++import os as _v620_os, sys as _v620_sys, time as _v620_time
++_V620_TRACE = _v620_os.environ.get("V620_PLE_TRACE") == "1"
++_v620_n = [0]
++def _v620_rlog(msg):
++    if _V620_TRACE:
++        _v620_sys.stderr.write("[V620-SMP %.3f] %s\n" % (_v620_time.time() % 1000, msg)); _v620_sys.stderr.flush()
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+-from vllm.distributed.device_communicators.rdna_all_reduce import rdna_ar_check
+ from vllm.compilation.counter import compilation_counter
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+@@ -318,6 +323,9 @@
+                 max_num_reqs=self.max_num_reqs,
+                 num_speculative_steps=self.num_speculative_steps,
+                 device=self.device,
++                # Only a speculator proposes draft tokens to relay. Diffusion
++                # LLMs also set num_speculative_steps > 0 but have no speculator.
++                relay_draft_tokens=self.speculative_config is not None,
+             )
+ 
+         # Samplers and decode_query_len created in load_model() after
+@@ -1036,7 +1044,18 @@
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs()
+             if outputs is not None:
++                # Spec decode: scatter relayed proposed draft tokens into this
++                # rank's state so the next step's combine_sampled_and_draft_tokens
++                # reads real values. Pop before postprocess_sampled (which does
++                # not accept this kwarg). idx_mapping has -1 for excluded/freed.
++                draft_tokens = outputs.pop("draft_tokens", None)
++                idx_mapping = outputs["idx_mapping"]
+                 self.postprocess_sampled(**outputs)
++                if draft_tokens is not None:
++                    valid = idx_mapping >= 0
++                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
++                        valid
++                    ]
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+@@ -1552,9 +1571,6 @@
+         is_profile: bool = False,
+         context_len: int = 0,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
+-        # T44b (gfx1030): a one-shot all-reduce that hit its spin cap in the previous step has
+-        # already returned garbage; read its host-mapped record (no sync) and fail loudly now.
+-        rdna_ar_check()
+         if not dummy_run:
+             # Update the request states.
+             self.update_pp_decode_requests()
+@@ -1907,6 +1923,11 @@
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+         )
++        if _V620_TRACE:
++            _v620_n[0] += 1
++            if _v620_n[0] <= 40:
++                _nr = input_batch.num_reqs
++                _v620_rlog(f"step{_v620_n[0]} reqs={_nr} sched={input_batch.num_scheduled_tokens[:_nr].tolist() if hasattr(input_batch.num_scheduled_tokens,'tolist') else input_batch.num_scheduled_tokens} computed={input_batch.num_computed_tokens_np[:_nr].tolist()} sampled={sampler_output.sampled_token_ids[:_nr].tolist()} num_sampled={num_sampled[:_nr].tolist()} num_rejected={num_rejected[:_nr].tolist()}")
+ 
+         if self.pp_handler is not None:
+             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+@@ -1948,7 +1969,13 @@
+         )
+ 
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+-        if self.speculator is not None and self.speculator.supports_mm_inputs:
++        # The encoder runner exists only on the first PP rank, so later ranks
++        # have no cached embeddings to gather.
++        if (
++            self.speculator is not None
++            and self.speculator.supports_mm_inputs
++            and self.model_state.supports_mm_inputs
++        ):
+             # Get cached multimodal embeddings for draft forward.
+             # NOTE: This is done here because postprocess updates
+             # num_computed_prefill_tokens.
+@@ -1999,6 +2026,11 @@
+                     mm_inputs=mm_inputs,
+                 )
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if self.pp_handler is not None:
++                # Relay the proposed draft tokens to non-last PP ranks so their
++                # next-step combine_sampled_and_draft_tokens reads real values
++                # instead of zero-init (otherwise spec acceptance ~= 0).
++                self.pp_handler.broadcast_draft(draft_tokens, input_batch)
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch
+--- a/vllm/v1/worker/gpu/pp_utils.py	2026-08-29 23:19:12.000000000 +0000
++++ b/vllm/v1/worker/gpu/pp_utils.py	2026-09-17 11:14:19.835253410 +0000
+@@ -12,6 +12,11 @@
+ from vllm.platforms import current_platform
+ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+ from vllm.v1.worker.gpu.input_batch import InputBatch
++import os as _v620_os, sys as _v620_sys, time as _v620_time
++_V620_TRACE = _v620_os.environ.get("V620_PLE_TRACE") == "1"
++def _v620_log(msg):
++    if _V620_TRACE:
++        _v620_sys.stderr.write("[V620-PPH %.3f] %s\n" % (_v620_time.time() % 1000, msg)); _v620_sys.stderr.flush()
+ 
+ 
+ @dataclass
+@@ -30,6 +35,12 @@
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    # Spec decode: proposed draft tokens relayed from the last rank, scattered
++    # into the non-last rank's req_states.draft_tokens on consume. None when
++    # the last rank has no speculator (see `relay_draft_tokens`).
++    # Ported from leapdragon/vllm-rdna2-recipe 0009 (Aron Hsiao);
++    # V2 relay originated in vllm-project/vllm#46994 (Chris Eastwood).
++    draft_tokens: torch.Tensor | None = None  # [num_reqs, max_sample_len - 1]
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -60,11 +71,22 @@
+     """
+ 
+     def __init__(
+-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
++        self,
++        max_num_reqs: int,
++        num_speculative_steps: int,
++        device: torch.device,
++        relay_draft_tokens: bool = False,
+     ):
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+         self.max_sample_len = num_speculative_steps + 1
++        # Whether the last rank relays proposed draft tokens
++        # (`broadcast_draft`). Must be derived from config, not from
++        # `self.speculator`, so every rank agrees on the per-step broadcast
++        # count. `num_speculative_steps > 0` is NOT equivalent: diffusion
++        # LLMs use draft tokens without a speculator, so the last rank
++        # would never send the third broadcast the others expect.
++        self.relay_draft_tokens = relay_draft_tokens
+         self.device = device
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
+@@ -99,6 +121,7 @@
+         slot = self.queue.popleft()
+         # Reserve this step's slot; `receive` overwrites it if applicable.
+         self.queue.append(None)
++        _v620_log(f"consume slot: {'None' if slot is None else f'reqs={slot.idx_mapping_np.tolist()} event_done={slot.event.query()} mask={slot.need_sampled_mask.tolist()}'}")
+         if slot is None:
+             return None
+ 
+@@ -121,6 +144,7 @@
+             num_sampled=slot.num_sampled,
+             num_rejected=slot.num_rejected,
+             idx_mapping=idx_mapping,
++            draft_tokens=slot.draft_tokens,
+         )
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+@@ -128,6 +152,7 @@
+         requests in the batch."""
+         assert not self.is_last_rank
+         need_sampled_mask = compute_need_sampled_mask(input_batch)
++        _v620_log(f"receive: reqs={input_batch.num_reqs} idx={input_batch.idx_mapping_np.tolist()} computed={input_batch.num_computed_tokens_np.tolist()} sched={input_batch.num_scheduled_tokens.tolist() if hasattr(input_batch.num_scheduled_tokens,'tolist') else input_batch.num_scheduled_tokens} prefill={input_batch.prefill_len_np.tolist()} maxlen={input_batch.max_seq_len_np.tolist()} mask={None if need_sampled_mask is None else need_sampled_mask.tolist()} shape=[{input_batch.num_reqs},{self.max_sample_len}]")
+         if need_sampled_mask is None:
+             # Leave this step's reserved slot as None.
+             return False
+@@ -149,12 +174,28 @@
+             torch.distributed.broadcast(
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
++            # Spec decode: 3rd broadcast on this group — the proposed draft
++            # tokens relayed by the last rank (matches broadcast_draft order).
++            # NCCL matches by op order; the deferred event covers it.
++            draft_tokens = None
++            if self.relay_draft_tokens:
++                draft_tokens = torch.empty(
++                    num_reqs,
++                    self.max_sample_len - 1,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    draft_tokens, src=self.last_rank, group=self.broadcast_group
++                )
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+-            # Must record_stream since these were allocated on broadcast stream but
+-            # later used on the main stream.
++            # Must record_stream since these were allocated on broadcast stream
++            # but later used on the main stream.
+             sampled_tokens.record_stream(self.main_stream)
+             combined.record_stream(self.main_stream)
++            if draft_tokens is not None:
++                draft_tokens.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -164,6 +205,7 @@
+             input_batch.idx_mapping_np,
+             need_sampled_mask,
+             gen_at_receive_np,
++            draft_tokens,
+         )
+         return bool(need_sampled_mask.all())
+ 
+@@ -175,11 +217,42 @@
+         input_batch: InputBatch,
+     ) -> None:
+         assert self.is_last_rank
++        _v620_m = compute_need_sampled_mask(input_batch)
++        _v620_log(f"broadcast: reqs={input_batch.num_reqs} idx={input_batch.idx_mapping_np.tolist()} computed={input_batch.num_computed_tokens_np.tolist()} sched={input_batch.num_scheduled_tokens.tolist() if hasattr(input_batch.num_scheduled_tokens,'tolist') else input_batch.num_scheduled_tokens} prefill={input_batch.prefill_len_np.tolist()} maxlen={input_batch.max_seq_len_np.tolist()} mask={None if _v620_m is None else _v620_m.tolist()} shape={tuple(sampled_token_ids.shape)} ns={tuple(num_sampled.shape)}")
+         if compute_need_sampled_mask(input_batch) is None:
+             # No request needs sampled outputs for a subsequent decode step.
+             return
++        # The receiver always posts a [num_reqs, max_sample_len] buffer, but
++        # under spec decode the sampler emits width 1 on any step with no
++        # draft tokens (prefill, first decode) and width (num_spec+1) only
++        # once rejection sampling has run. Pad to max_sample_len so the NCCL
++        # broadcast element count matches the receiver on EVERY step (an
++        # unpadded width-1 send vs a width-(num_spec+1) recv deadlocks).
++        # Trailing -1 columns are placeholders ignored by post_update, which
++        # advances each request by its per-request num_sampled valid count.
++        width = sampled_token_ids.shape[-1]
++        if width != self.max_sample_len:
++            assert width < self.max_sample_len
++            padded = sampled_token_ids.new_full(
++                (sampled_token_ids.shape[0], self.max_sample_len), -1
++            )
++            padded[:, :width] = sampled_token_ids
++            sampled_token_ids = padded
+ 
+         assert sampled_token_ids.dtype == torch.int64
++        # v620-pp3 (2026-09-15): under spec decoding the receivers post a
++        # [num_reqs, max_sample_len] buffer, but a prefill-only step (no draft
++        # tokens, e.g. the warmup prefill) samples [num_reqs, 1]. NCCL broadcast
++        # with mismatched element counts never completes and the pending recv
++        # event deadlocks the main stream pp_size steps later. Pad with the
++        # rejection-sampler placeholder (-1); num_sampled bounds the valid part.
++        if sampled_token_ids.shape[1] < self.max_sample_len:
++            pad = torch.full(
++                (sampled_token_ids.shape[0], self.max_sample_len - sampled_token_ids.shape[1]),
++                -1, dtype=sampled_token_ids.dtype, device=sampled_token_ids.device,
++            )
++            sampled_token_ids = torch.cat((sampled_token_ids, pad), dim=1)
++        assert sampled_token_ids.shape[1] == self.max_sample_len, sampled_token_ids.shape
+ 
+         if current_platform.is_xpu():
+             self.main_stream.synchronize()
+@@ -197,3 +270,30 @@
+             )
+             for tensor in (sampled_token_ids, num_sampled, num_rejected):
+                 tensor.record_stream(self.broadcast_stream)
++
++    def broadcast_draft(
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Relay proposed draft tokens from the last rank to non-last ranks.
++
++        Issued AFTER propose(), so it is the 3rd broadcast on this group
++        for the step (sampled, combined, draft) — matching the order in
++        which `receive` posts its recvs. Gated identically to `broadcast`
++        so op counts stay matched across ranks. Without this, non-last
++        ranks verify against a zero-init req_states.draft_tokens.
++        """
++        assert self.is_last_rank
++        if not self.relay_draft_tokens:
++            return
++        if compute_need_sampled_mask(input_batch) is None:
++            # No request needs sampled outputs next step; `broadcast`
++            # skipped too, so skip here to keep the per-step count matched.
++            return
++        draft_tokens = draft_tokens.to(torch.int64).contiguous()
++        with torch.cuda.stream(self.broadcast_stream):
++            # wait_stream so the side-stream broadcast sees propose() output.
++            self.broadcast_stream.wait_stream(self.main_stream)
++            torch.distributed.broadcast(
++                draft_tokens, src=self.last_rank, group=self.broadcast_group
++            )
++            draft_tokens.record_stream(self.broadcast_stream)
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py	2026-08-29 23:19:12.000000000 +0000
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py	2026-09-15 18:44:35.461188250 +0000
+@@ -60,8 +60,9 @@
+     target_inner = target_language_model.model
+     draft_inner = eagle_model.model
+ 
+-    # Skip embedding sharing under PP — each rank owns its own embedding.
+-    if get_pp_group().world_size == 1:
++    # v620-pp3: share the embedding under PP too when the target on this rank owns one
++    # (Qwen4Exp builds embed_tokens on every stage); the draft copy lives on the CPU.
++    if True:
+         target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+             target_inner, "embedding", None
+         )
+--- a/vllm/v1/worker/gpu_model_runner.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/v1/worker/gpu_model_runner.py	2026-09-17 11:14:19.839691967 +0000
+@@ -599,13 +599,7 @@
+             self.ngram_eos_token_id = 0
+         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
+             raise ValueError("N-gram embedding requires context length >= 1.")
+-        if self.uses_ngram_embedding and len(get_pp_group().ranks) > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1. With PP>1, ngram context is only "
+-                "injected on the first rank and can become incorrect on "
+-                "non-first ranks. Please run with PP=1."
+-            )
++        pass  # v620-pp3: PP guard lifted (PLE offload consumes ids on the PLE stage only)
+ 
+         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
+         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
+@@ -664,6 +658,10 @@
+ 
+         self.use_aux_hidden_state_outputs = False
+         # Set up speculative decoding.
++        # Under PP the drafter exists only on the last rank; the other ranks
++        # keep None so the shared paths (profile/dummy runs, attn-metadata
++        # isinstance dispatch) can still read the attribute.
++        self.drafter = None
+         # NOTE(Jiayi): currently we put the entire draft model on
+         # the last PP rank. This is not ideal if there are many
+         # layers in the draft model.
+@@ -4910,8 +4908,9 @@
+ 
+         spec_config = self.speculative_config
+         draft_after_bookkeeping = False
+-        if spec_config is not None:
++        if spec_config is not None and self.drafter is not None:
+             # Decide whether to run the drafter or zero out draft tokens.
++            # Non-last PP ranks leave drafter=None; skip this block.
+             input_fits_in_drafter = self._input_fits_in_drafter(
+                 spec_decode_common_attn_metadata
+             )
+@@ -4926,7 +4925,7 @@
+                 drafter_runs_model_forward
+                 and not spec_config.disable_padded_drafter_batch
+             )
+-            if use_gpu_toks:
++            if use_gpu_toks and self.drafter is not None:
+                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
+                 # as inputs, and does not need to wait for bookkeeping to finish.
+                 assert isinstance(
+@@ -5022,6 +5021,7 @@
+                 propose_draft_token_ids(valid_sampled_token_ids)
+             elif (
+                 drafter_runs_model_forward
++                and self.drafter is not None
+                 and self.parallel_config.data_parallel_size > 1
+             ):
+                 # Prevent hang when DP ranks disagree on input_fits_in_drafter
+@@ -5608,7 +5608,7 @@
+                     self.model = self.load_lora_model(
+                         self.model, self.vllm_config, self.device
+                     )
+-                if hasattr(self, "drafter"):
++                if getattr(self, "drafter", None) is not None:
+                     logger.info_once("Loading drafter model...")
+                     if hasattr(self.drafter, "load_model"):
+                         self.drafter.load_model(self.model)
+@@ -6458,10 +6458,15 @@
+             else:
+                 hidden_states = outputs
+ 
+-            if self.speculative_config and (
+-                self.speculative_config.use_eagle()
+-                or self.speculative_config.uses_draft_model()
+-                or self.speculative_config.uses_extract_hidden_states()
++            if (
++                self.speculative_config
++                # PP: non-last ranks have no drafter to dummy-run.
++                and self.drafter is not None
++                and (
++                    self.speculative_config.use_eagle()
++                    or self.speculative_config.uses_draft_model()
++                    or self.speculative_config.uses_extract_hidden_states()
++                )
+             ):
+                 assert isinstance(
+                     self.drafter,
+@@ -7466,9 +7471,14 @@
+         self.calculate_reorder_batch_threshold()
+ 
+         # Initialize drafter attention backend
+-        if self.speculative_config and (
+-            self.speculative_config.use_eagle()
+-            or self.speculative_config.uses_draft_model()
++        # (self.drafter is None on non-last PP ranks)
++        if (
++            self.speculative_config
++            and self.drafter is not None
++            and (
++                self.speculative_config.use_eagle()
++                or self.speculative_config.uses_draft_model()
++            )
+         ):
+             assert isinstance(
+                 self.drafter,
+@@ -7520,10 +7530,15 @@
+         )
+ 
+         # Initialize drafter's cudagraph dispatcher if using spec decode.
+-        if self.speculative_config and (
+-            self.speculative_config.use_eagle()
+-            or self.speculative_config.uses_draft_model()
+-            or self.speculative_config.uses_extract_hidden_states()
++        # (self.drafter is None on non-last PP ranks)
++        if (
++            self.speculative_config
++            and self.drafter is not None
++            and (
++                self.speculative_config.use_eagle()
++                or self.speculative_config.uses_draft_model()
++                or self.speculative_config.uses_extract_hidden_states()
++            )
+         ):
+             assert isinstance(
+                 self.drafter,
+@@ -7756,6 +7771,7 @@
+ 
+         if (
+             self.speculative_config
++            and self.drafter is not None
+             and self.speculative_config.uses_extract_hidden_states()
+         ):
+             assert isinstance(self.drafter, ExtractHiddenStatesProposer)
+--- a/vllm/v1/worker/gpu_worker.py	2026-09-06 14:42:12.000000000 +0000
++++ b/vllm/v1/worker/gpu_worker.py	2026-09-15 19:43:38.573906915 +0000
+@@ -14,6 +14,12 @@
+ import numpy as np
+ import regex as re
+ import torch
++import os as _v620_os, sys as _v620_sys, time as _v620_time
++_V620_TRACE = _v620_os.environ.get("V620_PLE_TRACE") == "1"
++_v620_step = [0]
++def _v620_wlog(msg):
++    if _V620_TRACE:
++        _v620_sys.stderr.write("[V620-PP %.3f] %s\n" % (_v620_time.time() % 1000, msg)); _v620_sys.stderr.flush()
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+@@ -235,6 +241,18 @@
+         # Resolved lazily on first sleep/wake; persists worker-process state.
+         self._sleep_mode_backend: SleepModeBackend | None = None
+ 
++    def _model_has_ple_offload_layers(self) -> bool:
++
++        # whether the loaded model on this rank contains a PLE offload layer (v620-pp3)
++
++        from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
++
++
++        model = self.model_runner.get_model()
++
++        return any(isinstance(m, PleOffloadLayer) for m in model.modules())
++
++
+     def _has_ple_layers(self) -> bool:
+         """Return whether this model configuration constructs PLE layers."""
+         if not envs.VLLM_PLE_CPU_OFFLOAD:
+@@ -265,8 +283,7 @@
+                 f"({parallel_config.data_parallel_size_local}/"
+                 f"{parallel_config.data_parallel_size} local ranks)"
+             )
+-        if parallel_config.pipeline_parallel_size != 1:
+-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
++        # PP accepted: the PLE layer(s) must sit on stage 0, which spawns the worker (v620-pp3).
+         if parallel_config.prefill_context_parallel_size != 1:
+             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
+         if parallel_config.decode_context_parallel_size != 1:
+@@ -604,7 +621,8 @@
+ 
+         # Model loading constructs the PLE placeholders whose CUDA buffers are
+         # registered by the shared MRV1/MRV2 offload client.
+-        if self._ple_offload_enabled:
++        # v620-pp3: only the stage(s) holding a PLE layer register with the worker
++        if self._ple_offload_enabled and self._model_has_ple_offload_layers():
+             self.model_runner._setup_ple_offload(
+                 self.parallel_config._ple_offload_ipc_path
+             )
+@@ -1233,6 +1251,10 @@
+             for handle in self._pp_send_work:
+                 handle.wait()
+             self._pp_send_work = []
++            if _V620_TRACE:
++                from vllm.model_executor.layers.ple_offload_layer import _v620_mark
++                _v620_mark("after_pp_send_wait")
++                _v620_wlog(f"rank{get_pp_group().rank_in_group} step{_v620_step[0]} pp_send wait returned")
+ 
+         intermediate_tensors = None
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+@@ -1270,6 +1292,8 @@
+                 )
+             }
+ 
++        _v620_step[0] += 1
++        _v620_wlog(f"rank{get_pp_group().rank_in_group} step{_v620_step[0]} toks={scheduler_output.total_num_scheduled_tokens} reqs={len(scheduler_output.num_scheduled_tokens)} recv={forward_pass and not get_pp_group().is_first_rank}")
+         if forward_pass and not get_pp_group().is_first_rank:
+             tensor_dict, comm_handles, comm_postprocess = (
+                 get_pp_group().irecv_tensor_dict(
+@@ -1278,6 +1302,7 @@
+                 )
+             )
+             assert tensor_dict is not None
++            _v620_wlog(f"rank{get_pp_group().rank_in_group} step{_v620_step[0]} recv posted")
+             intermediate_tensors = AsyncIntermediateTensors(
+                 tensor_dict,
+                 comm_handles=comm_handles,
+@@ -1307,11 +1332,13 @@
+         )
+ 
+         # launch non-blocking send of intermediate tensors
++        _v620_wlog(f"rank{get_pp_group().rank_in_group} step{_v620_step[0]} forward enqueued, isend")
+         self._pp_send_work = get_pp_group().isend_tensor_dict(
+             output.tensors,
+             all_gather_group=get_tp_group(),
+             all_gather_tensors=all_gather_tensors,
+         )
++        _v620_wlog(f"rank{get_pp_group().rank_in_group} step{_v620_step[0]} isend posted")
+ 
+         return None
+ 

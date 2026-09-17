@@ -1,0 +1,46 @@
+From 9c109fcc0dec9dfbe19b4fee50060958a74c8e87 Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Wed, 16 Sep 2026 20:48:22 +0000
+Subject: [PATCH 08/16] v620: pass w2_zp to try_rocm_moe_skinny_decode at the
+ call sites that omitted it (moe_wna16/AutoRound path)
+
+---
+ vllm/model_executor/layers/fused_moe/experts/triton_moe.py | 2 ++
+ vllm/model_executor/layers/fused_moe/fused_moe.py          | 1 +
+ 2 files changed, 3 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+index ac668aa6fd..b63b97c4d6 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+@@ -253,6 +253,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+             output,
+             use_int4_w4a16=self.quant_config.use_int4_w4a16,
+             w1_zp=self.quant_config.w1_zp,
++            w2_zp=self.quant_config.w2_zp,
+             block_shape=self.block_shape,
+             activation=activation,
+             expert_map=expert_map,
+@@ -669,6 +670,7 @@ class TritonWNA16Experts(TritonExperts):
+             output,
+             use_int4_w4a16=self.quant_config.use_int4_w4a16,
+             w1_zp=self.quant_config.w1_zp,
++            w2_zp=self.quant_config.w2_zp,
+             block_shape=self.block_shape,
+             activation=activation,
+             expert_map=expert_map,
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 7879fcd210..86b583f195 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -1644,6 +1644,7 @@ def fused_experts(
+             out,
+             use_int4_w4a16=quant_config.use_int4_w4a16,
+             w1_zp=quant_config.w1_zp,
++            w2_zp=quant_config.w2_zp,
+             block_shape=quant_config.block_shape,
+             activation=activation,
+             expert_map=expert_map,
+-- 
+2.43.0
+

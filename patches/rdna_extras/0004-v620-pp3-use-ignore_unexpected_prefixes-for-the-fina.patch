@@ -1,0 +1,30 @@
+From 27387b922ce9864250507276d933eebc692988cf Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Tue, 15 Sep 2026 14:23:04 +0000
+Subject: [PATCH 04/16] v620-pp3: use ignore_unexpected_prefixes for the final
+ mixer
+
+---
+ vllm/models/qwen4_exp/amd/model.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/amd/model.py b/vllm/models/qwen4_exp/amd/model.py
+index fdbfc549b0..d45751515e 100644
+--- a/vllm/models/qwen4_exp/amd/model.py
++++ b/vllm/models/qwen4_exp/amd/model.py
+@@ -637,10 +637,10 @@ class Qwen4ExpModel(nn.Module):
+             orig_to_new_substr={substr: None for substr in skip_substrs}
+         )
+         # v620-pp3: the final mixer only exists on the last pipeline stage
+-        skip_prefixes = [] if get_pp_group().is_last_rank else ["hyper_connection_mixer."]
++        pp_ignored = [] if get_pp_group().is_last_rank else ["hyper_connection_mixer."]
+         loader = AutoWeightsLoader(
+             self,
+-            skip_prefixes=skip_prefixes,
++            ignore_unexpected_prefixes=pp_ignored,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+         loaded = loader.load_weights(
+-- 
+2.43.0
+

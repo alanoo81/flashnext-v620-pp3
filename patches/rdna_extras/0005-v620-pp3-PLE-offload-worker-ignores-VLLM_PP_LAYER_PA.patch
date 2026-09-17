@@ -1,0 +1,27 @@
+From ad7c4ed74e33da6c457caa99cff9aaa40bd7e33d Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Tue, 15 Sep 2026 15:08:39 +0000
+Subject: [PATCH 05/16] v620-pp3: PLE offload worker ignores
+ VLLM_PP_LAYER_PARTITION
+
+---
+ vllm/v1/ple_offload/worker.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 4e2e97f55b..5656860b44 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -256,6 +256,9 @@ class PleOffloadWorker:
+         death_pipe: Connection,
+     ) -> None:
+         """Load PLE weights, accept registrations, and run the request loop."""
++        # v620-pp3: the offload worker rebuilds the model with pp_size=1; a pipeline layer
++        # partition meant for the GPU ranks must not apply here.
++        os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+         decorate_logs("PleOffloadWorker")
+         ready_reader, ready_writer = ready_pipe
+         ready_reader.close()
+-- 
+2.43.0
+
