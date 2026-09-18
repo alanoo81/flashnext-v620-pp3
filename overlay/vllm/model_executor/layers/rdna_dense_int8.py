@@ -122,8 +122,50 @@ def weight_for_gemm(
 
 
 @torch.no_grad()
+def _v620_fake_quant(layer: torch.nn.Module) -> None:
+    """V620 quality experiment (opt-in, V620_FAKEQ_DENSE="<bits>:<group>[:asym][:<min_numel>]"): quantise then
+    dequantise the big dense projections in place, so the served logits carry exactly the error an int4 dense
+    kernel would have while the speed path is unchanged. Default min_numel 8e6 = in_proj_qkv/z, out_proj, q/o_proj."""
+    spec = os.getenv("V620_FAKEQ_DENSE", "")
+    if not spec:
+        return
+    w = getattr(layer, "weight", None)
+    if w is None or w.dim() != 2 or not w.is_cuda or w.dtype not in (torch.float16, torch.bfloat16):
+        return
+    parts = spec.split(":")
+    bits, group = int(parts[0]), int(parts[1]) if len(parts) > 1 else 128
+    asym = "asym" in parts
+    nums = [p for p in parts[2:] if p.replace(".", "").replace("e", "").isdigit()]
+    min_numel = int(float(nums[0])) if nums else 8_000_000
+    n, k = w.shape
+    if w.numel() < min_numel or k % group != 0:
+        return
+    num = den = 0.0
+    for r0 in range(0, n, 2048):  # by row blocks: the fp32 temporaries must not outlive the load (VRAM is tight)
+        blk = w.data[r0:r0 + 2048]
+        g = blk.float().reshape(blk.shape[0], k // group, group)
+        if asym:
+            lo, hi = g.amin(-1, keepdim=True), g.amax(-1, keepdim=True)
+            sc = ((hi - lo) / (2**bits - 1)).clamp_min(1e-10)
+            q = torch.round((g - lo) / sc).clamp_(0, 2**bits - 1) * sc + lo
+        else:
+            qmax = 2 ** (bits - 1) - 1
+            sc = (g.abs().amax(-1, keepdim=True) / qmax).clamp_min(1e-10)
+            q = torch.round(g / sc).clamp_(-qmax - 1, qmax) * sc
+        num += (q - g).pow(2).sum().item(); den += g.pow(2).sum().item()
+        blk.copy_(q.reshape(blk.shape).to(w.dtype))
+        del g, q, sc
+    err = (num / max(den, 1e-20)) ** 0.5
+    torch.cuda.empty_cache()
+    global _FAKEQ_N
+    _FAKEQ_N = globals().get("_FAKEQ_N", 0) + 1
+    if _FAKEQ_N <= 6:
+        logger.warning("V620_FAKEQ_DENSE=%s: %dx%d fake-quantised, relative error %.4f", spec, n, k, err)
+
+
 def make_shadow(layer: torch.nn.Module) -> None:
     """Attach `weight_i8` / `weight_i8_scale` to a layer whose `weight` is fp16 [N, K]."""
+    _v620_fake_quant(layer)
     if not enabled():
         return
     w = getattr(layer, "weight", None)

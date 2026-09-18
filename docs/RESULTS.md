@@ -175,6 +175,37 @@ So the remaining decode lever is weight bytes, not kernels or interconnect: int4
 
 **TunableOp tuned for PP3 shapes: no gain.** leapdragon's rows were tuned under TP4; seven TP1 shapes were missing at N=2048 (8192×2560, 5120×2560, 2560×6144, …). `TUNEOP=tune` (40 min, `scripts/tune-pp3.sh`) added 214–268 rows per rank; A/B in one session: prefill 1 154 → 1 170 (4K), 1 770 → 1 764 (16K), decode 50.9 → 50.9, MTP decode within run-to-run noise. The PP3 rows are nevertheless the launcher's default (`overlay/tunableop-pp3/`): they are a superset of leapdragon's and match the shapes this setup runs.
 
+## 6c. Quality bench (18 Sept, night) — what the approximations cost, and why int4 dense is not worth it
+
+`scripts/qual.py`: 40 blocks of 2 048 tokens from one corpus (81 880 positions), the same token ids sent to every configuration, vLLM `prompt_logprobs=20` (works under PP3 on this fork), prefix caching off. Per configuration: perplexity; against a reference: mean KL over the reference's top-20 (lower bound), share of positions whose top-1 token differs. Two minutes per reading. Reference = Triton MoE + fp16 dense, the closest to the original model this machine can run, and bit-deterministic (two readings identical).
+
+| configuration | perplexity | Δ | mean KL | top-1 differs |
+|---|---|---|---|---|
+| Triton MoE + fp16 dense (reference) | 4.0150 | — | — | — |
+| Triton MoE + **int8 dense shadows** (`DENSE_INT8`) | 4.0135 | −0.04 % | 0.042 | 7.8 % |
+| **MoE HIP** + fp16 dense | 4.025–4.029 | +0.2–0.3 % | 0.034 | 7.0 % |
+| **what we serve** (MoE HIP + int8 dense) | 4.022–4.027 | +0.2–0.3 % | 0.055 | 8.9 % |
+
+- **int8 dense is free** (±0.04 %).
+- **The MoE HIP kernel is not deterministic**: two readings on the same server differ (KL 0.008, 3.5 % of top-1 tokens, ±0.1 % perplexity), where the Triton MoE path repeats bit for bit with either dense mode; it also costs a consistent +0.2–0.3 % perplexity. Small, and not a reason to give up +60 % prefill, but worth a look upstream (fp16 accumulation order, or a race — not established).
+- This model amplifies any numerical perturbation: even int8, which leaves perplexity untouched, flips 7–8 % of top-1 tokens (KL 0.03–0.05) — presumably expert routing, 512 experts and near-ties. KL is therefore a poor discriminator here; perplexity (noise ≈ 0.1 %) is the usable signal.
+
+Simulated weight-only quantisation of the big dense projections (the 37 % of decode compute of §6b), `V620_FAKEQ_DENSE=<bits>:<group>[:asym]` — quantise-dequantise in place at load, RTN, same speed path, logits carry the exact error a real kernel would have:
+
+| dense projections | perplexity | Δ | top-1 differs |
+|---|---|---|---|
+| int8 g128 (negative control) | 4.017 | +0.04 % | 4.9 % |
+| int6 g128 | 4.040 | +0.6 % | 8.3 % |
+| int5 g32 asymmetric (≈ 6 bits/weight with scales) | 4.035 | +0.5 % | 9.1 % |
+| int5 g128 | 4.107 | +2.3 % | 12.2 % |
+| int4 g32 asymmetric | 4.184 | +4.2 % | 14.0 % |
+| int4 g32 | 4.369 | +8.8 % | 16.7 % |
+| int4 g128 asymmetric | 4.474 | +11.4 % | 17.7 % |
+| int4 g128 | 4.590 | +14.3 % | 20.6 % |
+| int3 g128 (positive control) | 13.18 | +228 % | 44.7 % |
+
+**Conclusion: RTN int4 on the attention / GDN projections costs +4 to +14 % perplexity for an estimated +18 % decode — rejected.** ~6 bits per weight holds at +0.5 %, but would buy only ~+7 % decode and needs a new kernel. A calibrated method (AutoRound / GPTQ) might do better and is out of reach on this machine. Decode on this hardware is at its practical ceiling with int8 dense + int4 experts + MTP.
+
 ## 7. MTP directly on opengfx1030 (worktree on `50120e1`, PP3, eager, cache off, 4K / 16K)
 
 | runner | MTP | decode tok/s | acceptance |
