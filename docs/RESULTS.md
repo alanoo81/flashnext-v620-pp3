@@ -58,12 +58,14 @@ Memory clock: GDDR6 DPM levels 96 / 456 / 673 / 1 000 MHz, no `OD_MCLK` in the O
 
 `perf3 --conc N`: N streams started together; "overlapped decode" = Σ of each stream's own decode rate (the streams' decode windows overlap almost entirely with 512-token prompts); "wall" divides all generated tokens by the wall time including the serialised prefills.
 
-| configuration | c=1 | c=4 overlapped (wall) | c=8 overlapped (wall) |
-|---|---|---|---|
-| **leapdragon + MoE HIP + cudagraphs, no MTP** | 48.8 | **157** (127) — 39 per stream | **242** (184) — 30 per stream |
-| leapdragon + MoE HIP + cudagraphs + MTP k=2 | 62.5 | 53 (48) — 13 per stream | 90 (77) — 11 per stream |
+| configuration | c=1 | c=4, all at once | c=4, arrivals 0.7 s apart | c=8, all at once | c=8, 0.7 s apart |
+|---|---|---|---|---|---|
+| **leapdragon + MoE HIP + cudagraphs, no MTP** | 48.8 | **157** (127) — 39 per stream | — | **242** (184) — 30 per stream | 207 (156) |
+| leapdragon + MoE HIP + cudagraphs + MTP k=2 | 62.5 | 56 (51) — 14 per stream | **159** (116) — 40 per stream | 90 (77) | 91 (77) |
 
-Rule: MTP k=2 for a single user; from two streams on, serve without MTP. The MTP batch collapse (~180 ms per step at c=4 vs 25 ms without MTP) is under investigation (suspected eager fallback of the speculative shapes). For reference, leapdragon TP4+EP reports 64 → 127 tok/s at 12 streams and Minachist (3× RTX 3090, PP3) 60 → 155 at 4.
+The MTP "collapse" at c=4 is a scheduling lock-step, not a kernel problem: requests that arrive at the same instant land in one batch and stay there, and with speculative decoding a request cannot be rescheduled until its draft tokens come back from the last stage, so only one batch is ever in flight and the three stages run serially (56 ≈ the single-stream 62). Without MTP the async scheduler keeps `pp_size` batches in flight with placeholder tokens. Evidence: `--max-num-seqs 2` at c=4 → 95 tok/s wall (two batches in flight, each stream at its single-stream 58), `--max-num-seqs 1` → 53 (fully serial), and arrivals 0.7 s apart with `--max-num-seqs 8` → 159 overlapped, the same as without MTP. Triton JIT during inference was ruled out (5 compilations over a whole run). At 8 streams MTP stays at ~90 whatever the arrival pattern — the verify batches grow and the drafter's fp16 MoE (Triton `fused_moe_kernel`, 12 % of last-stage GPU time in the c=4 profile) weighs — so the rule is **MTP k=2 up to ~4 streams, no MTP beyond**. For reference, leapdragon TP4+EP reports 64 → 127 tok/s at 12 streams and Minachist (3× RTX 3090, PP3) 60 → 155 at 4.
+
+Two knobs from Minachist's write-up checked on ROCm: `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` fixes the KV auto-sizing (262K, KV auto: 363K tokens without MTP, 344K with k=2, where the default profiler refused to boot) — use it instead of pinning `--kv-cache-memory-bytes`; `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` breaks the PLE offload worker's cross-process registration on ROCm (`hipErrorInvalidValue`) — do not set it.
 
 ## 3a. Older concurrency numbers (17 Sept, 4 streams, 4K prompts, 200 tokens each — prefill-contaminated, kept for the record)
 

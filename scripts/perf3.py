@@ -8,6 +8,7 @@ port, api, ns = int(args[0]), args[1], [int(x) for x in args[2].split(",")]
 ngen = int(args[3]) if len(args) > 3 else 200
 reps = int(sys.argv[sys.argv.index("--reps") + 1]) if "--reps" in sys.argv else 2
 conc = int(sys.argv[sys.argv.index("--conc") + 1]) if "--conc" in sys.argv else 0
+stagger = float(sys.argv[sys.argv.index("--stagger") + 1]) if "--stagger" in sys.argv else 0.0
 tag = sys.argv[sys.argv.index("--tag") + 1] if "--tag" in sys.argv else api
 twoshot = "--twoshot" in sys.argv  # prefill mesuré avec max_tokens=1, gen sur préfixe en cache (cache ON requis)
 U = f"http://127.0.0.1:{port}"
@@ -83,6 +84,7 @@ if conc:
     ps = [prompt_for(n, off)[0] for off in offs]
     results = [None] * conc; tstart = [0.0] * conc
     def work(i):
+        time.sleep(i * stagger)
         tstart[i] = time.time()
         try: results[i] = run_one(ps[i], ngen)
         except Exception as e: results[i] = e
