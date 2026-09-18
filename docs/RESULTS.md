@@ -65,6 +65,15 @@ Memory clock: GDDR6 DPM levels 96 / 456 / 673 / 1 000 MHz, no `OD_MCLK` in the O
 
 The MTP "collapse" at c=4 is a scheduling lock-step, not a kernel problem: requests that arrive at the same instant land in one batch and stay there, and with speculative decoding a request cannot be rescheduled until its draft tokens come back from the last stage, so only one batch is ever in flight and the three stages run serially (56 ≈ the single-stream 62). Without MTP the async scheduler keeps `pp_size` batches in flight with placeholder tokens. Evidence: `--max-num-seqs 2` at c=4 → 95 tok/s wall (two batches in flight, each stream at its single-stream 58), `--max-num-seqs 1` → 53 (fully serial), and arrivals 0.7 s apart with `--max-num-seqs 8` → 159 overlapped, the same as without MTP. Triton JIT during inference was ruled out (5 compilations over a whole run). At 8 streams MTP stays at ~90 whatever the arrival pattern — the verify batches grow and the drafter's fp16 MoE (Triton `fused_moe_kernel`, 12 % of last-stage GPU time in the c=4 profile) weighs — so the rule is **MTP k=2 up to ~4 streams, no MTP beyond**. For reference, leapdragon TP4+EP reports 64 → 127 tok/s at 12 streams and Minachist (3× RTX 3090, PP3) 60 → 155 at 4.
 
+**Quantised MTP drafter (18 Sept, 10:30).** The checkpoint leaves the draft head's 512 experts in bf16 (`mtp.layers.0.mlp.experts.{gate_up_proj,down_proj}`, 4.9 GB), so under MTP they ran through the generic Triton `fused_moe_kernel`. `scripts/quant_mtp_experts.py` quantises them offline (RTN, symmetric int4, group 128, packed exactly like the main experts) into a derived checkpoint (1.38 GB shard, hard links for the rest, `quantization_config.ignore` narrowed to `re:^mtp\.(?!layers\.\d+\.mlp\.experts(\.|$)).*` — the drafter is built as `mtp.layers.48.*` and `get_moe_method` probes `experts.0.<proj>`), and the drafter experts then go through the same HIP kernel:
+
+| MTP k=2, MoE HIP, cudagraphs | c=1 (4K / 16K) | acceptance | c=4, 0.7 s apart | c=8, 0.7 s apart (wall) |
+|---|---|---|---|---|
+| drafter experts bf16 (Triton) | 59.8 / 62.5 | 70 % (2.41) | 159 (116 wall) | 91 (77) |
+| **drafter experts W4A16 (HIP)** | **64.9 / 66.3** | 75 % (2.50) | 160 (121 wall) | **123 wall** |
+
+No measurable acceptance loss (RTN error ~13 % relative on the weights), +4–7 % single stream, +60 % wall throughput at 8 streams (no-MTP at 8 streams, same arrival pattern: 156 wall).
+
 Two knobs from Minachist's write-up checked on ROCm: `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` fixes the KV auto-sizing (262K, KV auto: 363K tokens without MTP, 344K with k=2, where the default profiler refused to boot) — use it instead of pinning `--kv-cache-memory-bytes`; `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` breaks the PLE offload worker's cross-process registration on ROCm (`hipErrorInvalidValue`) — do not set it.
 
 ## 3a. Older concurrency numbers (17 Sept, 4 streams, 4K prompts, 200 tokens each — prefill-contaminated, kept for the record)

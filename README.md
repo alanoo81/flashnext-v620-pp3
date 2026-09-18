@@ -19,7 +19,7 @@ PP=3 / TP=1 (nothing in this model divides by 3, so TP is impossible), fp16, AWQ
 | leapdragon + **opengfx1030 MoE HIP kernel** (this repo) | 1 201 / 1 794 / — / — | 48 | — |
 | **leapdragon + MoE HIP + cudagraphs + MTP k=2 + prefix caching** | **1 078 / 1 863 / 1 989 / 2 493** | **57–63** | **262K** (1 full request) |
 
-Multi-stream, decode only (512-token prompts, 18 Sept): **without MTP 48.8 → 157 tok/s at 4 streams → 242 at 8**; with MTP k=2 62.5 → 159 at 4 (with staggered arrivals; simultaneous arrivals lock-step into one batch and give 56) → 91 at 8 — so MTP k=2 up to ~4 streams, plain cudagraphs beyond. A 200 W power cap adds +11–13 % prefill (decode unchanged). See [`docs/RESULTS.md`](docs/RESULTS.md) §2b–3 for what else was tried (k=3, P2P level, batched tokens, memory clock) and why 262K is the ceiling.
+Multi-stream, decode only (512-token prompts, 18 Sept): **without MTP 48.8 → 157 tok/s at 4 streams → 242 at 8**; with MTP k=2 62.5 → 159 at 4 (staggered arrivals; simultaneous arrivals lock-step into one batch and give 56) → 91 at 8; with the MTP drafter's experts quantised to W4A16 (`scripts/quant_mtp_experts.py`, same HIP kernel) 65–66 single stream, 160 at 4, 123 wall at 8 — so MTP k=2 (quantised drafter) up to ~4–8 streams, plain cudagraphs for more. A 200 W power cap adds +11–13 % prefill (decode unchanged). See [`docs/RESULTS.md`](docs/RESULTS.md) §2b–3 for what else was tried (k=3, P2P level, batched tokens, memory clock) and why 262K is the ceiling.
 
 The combined line ran 30 minutes of random-size/burst traffic at 131K context (134 iterations, 0 errors, 0 corrupted outputs), 4-stream bursts clean, and a 262K server (KV pool 293K tokens at `--kv-cache-memory-bytes 3.5e9`, VRAM 33.2 / 32.2 / 32.1 GB). Decode above 32K is measured on the streaming client and should be confirmed with server counters; the 261K prefill figure (2 716 tok/s) was taken with prefix caching on and may include partial hits. Full tables: [`docs/RESULTS.md`](docs/RESULTS.md).
 
@@ -31,7 +31,7 @@ overlay/            files mounted over /app/vllm in the leapdragon image (vllm-p
 rdna2-moe/          opengfx1030's moe_q_gemm_rdna2.cu + headers, torch-extension binding, setup.py, build.sh
 patches/leapdragon/ the same overlay as one unified diff against the 20260915-g1bdbbef4b image
 patches/rdna_extras/ 16 git patches on opengfx1030 50120e1: PP3 support + MTP fixes (V2 runner) + diagnostics
-scripts/            launchers (container + native TheRock venv), harness (perf3/stab/burst/cachetest3/sweep), test drivers
+scripts/            launchers (container + native TheRock venv), harness (perf3/stab/burst/cachetest3/sweep), test drivers, quant_mtp_experts.py (W4A16 MTP drafter)
 docs/               JOURNEY.md (every step, 15–17 Sept), RESULTS.md, the opengfx1030 report (§0–13), the llama.cpp PP3 guide
 prompts/            the exact prompts of the corruption repro (4 336 / 1 614 tokens) and the GDN sanitizer patch
 ```
