@@ -145,6 +145,7 @@ The combined configuration's 4-stream bursts (2 808 / 3 783 / 4 776 / 713-token 
 | opengfx1030 + fix, cache **on** (V2, V1, +PR #55506, `--max-num-seqs 2`) | — | — | **1 stream at iteration 12, deterministic** | second defect, cache must stay off |
 | leapdragon cudagraphs, cache on, same seed | 20 min | 74 | 0 | |
 | **leapdragon + MoE HIP + MTP k=2 + cache on, ctx 131K** | 30 min | 134 iterations / 196 outputs | 0 | 4 suspects (corpus continuations in bursts), 0 errors |
+| same + W4A16 drafter, **VRAM 1 075 MHz, 200 W cap** (18 Sept 17:35) | 30 min | 154 iterations / 223 outputs | 0 | 6 suspects (corpus continuations), 0 errors, final burst clean, 0 amdgpu events; junction max 80 / 80 / 71 °C, memory 72 / 72 / 66 °C, chassis fan at 100 % (junction ≥ 75 °C) for more than half of the run |
 
 ## 5. Prefix caching (same 9 645-token prompt sent 3× to an idle server)
 
