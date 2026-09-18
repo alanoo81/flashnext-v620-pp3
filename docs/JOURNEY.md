@@ -60,6 +60,15 @@ Conclusion: each tree had half — opengfx1030 the prefill (MoE HIP), leapdragon
 - **leapdragon + MoE HIP, cudagraphs: 1 201 / 1 794 tok/s prefill at 4K / 16K, decode 48 unchanged**, bursts clean.
 - **+ MTP k=2 + prefix caching (17,18,13, KV 3.5e9): 1 078 / 1 863 prefill, 57–62 decode at 4K/16K; at 131K: 1 843 / 1 989 / 2 493 prefill at 32K/65K/130K; 30 min stability (134 iterations, 196 ok, 4 "suspects" = the model continuing the corpus in bursts, 0 errors); 262K server boots (KV 293K tokens, 1.12 full requests, VRAM 33.2/32.2/32.1 GB), 1 859 / 1 313 / 2 716 prefill at 131K/200K/261K.**
 
+## 18 Sept, morning — everything else on the combined configuration
+
+- Audit of leapdragon's `CHANGES.md` / `RESULTS.md` against PP3: T43 (fp16 GEMV), T45/T45b (int8 shadows, `DENSE_INT8=1 …_ONLY=1`), T46 (launch fusion), §8a/8c (PLE protocol, doorbell, prefault), §8d (MoE config, TunableOp, QSA tiles), §8e (capture sizes) all applied; T44 (one-shot all-reduce) is TP-only; the PCIe stability kernel line was never needed here.
+- Power: **200 W cap = +11–13 % prefill**, decode unchanged. MTP k=3, `NCCL_P2P_LEVEL=SYS`, `--max-num-batched-tokens 4096`, forced memory clock: none helps (details in RESULTS §2b).
+- 262K: `--kv-cache-memory-bytes 4.5e9` gives 377K tokens (1.44 requests); the model's native window is 262 144 (no rope scaling in the checkpoint), beyond that would be YaRN through `--hf-overrides`, unvalidated on the AMD path — not attempted.
+- **Concurrency, measured properly** (decode only, 512-token prompts): without MTP 48.8 → 157 (c=4) → 242 tok/s (c=8); with MTP k=2 62.5 → 53 → 90. The earlier "c=4 = 32 tok/s" was the harness feeding 4K prompts whose serialised prefills sat inside the measurement window. Rule: MTP for one user, no MTP from two streams.
+- **Minachist's QSA K/V host offload** (`Minachist/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound`, `vllm-patch/`): UVA works on ROCm inside the leapdragon image (sparse 2 048-row gather over PCIe at 16 GB/s, Triton reads host memory at 21.6 GB/s), and the patch transposes to the AMD path (3 of 4 hunks apply, `kv_cache_utils` by hand; overlay `ff0134d`, opt-in `VLLM_QSA_KV_OFFLOAD=1`, no MTP). It does not boot: leapdragon's "CSA+linear" KV grouping stores each request's GDN state inside a **per-layer** main-KV page, and with 2-byte GPU slots that page is 24 KB against a 3.2 MB state (`kv_cache_utils.get_kv_cache_groups`). Minachist's vLLM 0.29 base sizes the mamba page against the sum over layers. Next step if wanted: give the mamba states their own pool in leapdragon's grouping — a few hours, worth ~4× the KV capacity (multi-262K), not speed.
+- **VRAM 1 075 MHz** (Tamalero): in-driver equivalent written and built (`v620-odcaps-unlock.patch` on the patched amdgpu), pending a host reboot.
+
 ## What is still open
 
 1. Re-measure the 261K prefill with prefix caching off (possible partial hits) and decode > 32K with server counters (the streaming client mis-measures MTP at long context).

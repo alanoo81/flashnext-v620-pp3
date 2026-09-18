@@ -79,16 +79,22 @@ for n in ns:
         pp = sum(r["pp"] for r in res) / len(res); gen = sum(r["gen"] for r in res) / len(res)
         print(f"== {tag:10s} N={n:6d} PP={pp:7.1f} GEN={gen:5.1f}", flush=True)
 if conc:
-    n = 4096; ps = [prompt_for(n, off)[0] for off in (0, 300000, 620000, 900000)][:conc]
-    results = [None] * conc
+    n = int(sys.argv[3].split(",")[0]); offs = [i * 110000 for i in range(conc)]
+    ps = [prompt_for(n, off)[0] for off in offs]
+    results = [None] * conc; tstart = [0.0] * conc
     def work(i):
+        tstart[i] = time.time()
         try: results[i] = run_one(ps[i], ngen)
         except Exception as e: results[i] = e
     t0 = time.time(); th = [threading.Thread(target=work, args=(i,)) for i in range(conc)]
     [t.start() for t in th]; [t.join() for t in th]; wall = time.time() - t0
-    good = [r for r in results if isinstance(r, dict)]
-    tot = sum(r["ctoks"] for r in good); ok = sum(1 for r in good if GOOD.search(r["out"]))
+    good = [(i, r) for i, r in enumerate(results) if isinstance(r, dict)]
+    tot = sum(r["ctoks"] for _, r in good); ok = sum(1 for _, r in good if GOOD.search(r["out"]))
     for i, r in enumerate(results):
-        if isinstance(r, dict): print(f"   flux {i} off={(0,300000,620000,900000)[i]} gen={r['gen']:.1f} ttft={r['ttft']:.1f}s {'ok ' if GOOD.search(r['out']) else '?? '} {r['out'][:140]!r}")
+        if isinstance(r, dict): print(f"   flux {i} off={offs[i]} gen={r['gen']:.1f} ttft={r['ttft']:.1f}s {'ok ' if GOOD.search(r['out']) else '?? '} {r['out'][:140]!r}")
         else: print(f"   flux {i} ERREUR {r}")
-    print(f"== {tag:10s} CONC c={conc} N=4096: {tot} tokens en {wall:.1f}s = {tot/wall:.1f} t/s agrégés, gen moyen/flux {sum(r['gen'] for r in good)/max(1,len(good)):.1f}, TTFT moyen {sum(r['ttft'] for r in good)/max(1,len(good)):.1f}s, {ok}/{len(good)} cohérents, {conc-len(good)} erreurs", flush=True)
+    # fenêtre où tous les flux décodent en même temps : [dernier TTFT, première fin]
+    t_ttft = [tstart[i] + r["ttft"] for i, r in good]; t_end = [tstart[i] + r["wall"] for i, r in good]
+    win = max(0.0, min(t_end) - max(t_ttft)) if good else 0.0
+    sum_gen = sum(r["gen"] for _, r in good)
+    print(f"== {tag:10s} CONC c={conc} N={n}: {tot} tokens en {wall:.1f}s = {tot/wall:.1f} t/s agrégés (prefill inclus) | décode chevauché ≈ {sum_gen:.1f} t/s (Σ gen/flux, fenêtre commune {win:.1f}s) | gen moyen/flux {sum_gen/max(1,len(good)):.1f}, TTFT moyen {sum(r['ttft'] for _, r in good)/max(1,len(good)):.1f}s, {ok}/{len(good)} cohérents, {conc-len(good)} erreurs")

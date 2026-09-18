@@ -39,7 +39,33 @@ Decode 48 vs 32 on the leapdragon lines: image 20260915 + `VLLM_RDNA_DENSE_INT8=
 | + opengfx1030 `moe_gptq_gemm_rdna2` as a torch extension | **1 201** | **1 794** | 48.4 |
 | + MTP k=2 + prefix caching (ctx 131K) | 1 078 | 1 863 | 57–63 |
 
-## 3. Concurrency (4 streams, 4K prompts, 200 tokens each)
+## 2b. What else was tried on the combined configuration (18 Sept, 65K ctx, cache on, 4K / 16K / 32K / 60K prompts)
+
+| change | prefill tok/s | decode tok/s | verdict |
+|---|---|---|---|
+| reference, 160 W cap | 1 089 / 1 879 / 2 029 / 2 544 | 58–65 | — |
+| **200 W cap** (undervolt −40 mV kept) | 1 206 / 2 096 / 2 262 / 2 870 | 60–66 | **+11–13 % prefill** (compute-bound: cards sit at the cap with sclk throttled to 1.5–2.3 GHz), decode within noise |
+| MTP k=3 | 1 075 / 1 841 / 2 003 / 2 511 | 56–67 | wash (2.96 tokens/step at 65 % acceptance), 8 % less KV |
+| `NCCL_P2P_LEVEL=SYS` | 1 078 / 1 847 / 2 008 / 2 510 | 59–65 | −1–2 % (leapdragon's +8 % came from TP all-reduces; PP has none) |
+| `--max-num-batched-tokens 4096` | 903 / 1 406 / 1 484 / 2 105 | 58–65 | −17–27 %, keep 2 048 |
+| memory clock forced to 1 000 MHz (`manual`, `pp_dpm_mclk 3`) | 1 082 / 1 871 / 2 018 / 2 544 | 56–63 | identical: mclk already sits at 1 000 MHz during active phases (0.25 s sampling), the 96 MHz dips are idle gaps |
+| 262K ctx, `--kv-cache-memory-bytes 4.5e9` | 1 862 (131K) / 1 247 (261K) | — | KV 377K tokens = 1.44 full requests, GPU0 holds |
+| 262K ctx, no MTP, KV auto (0.95) | boot fails | — | profiler leaves 2.2 GiB < 2.21 needed — always pin the KV size |
+
+Memory clock: GDDR6 DPM levels 96 / 456 / 673 / 1 000 MHz, no `OD_MCLK` in the OverDrive table of this VBIOS (only `OD_VDDGFX_OFFSET`). An in-driver unlock of the OverDrive capability flags (the same four bytes as [Tamalero/amd-v620-soft-unlock](https://github.com/Tamalero/amd-v620-soft-unlock) flips in the ROM, done in `sienna_cichlid_patch_pptable_quirk` for subsystem `0x0e34`) builds cleanly against the patched amdgpu; it would expose UCLK 674–1 075 MHz — not yet applied (needs a host reboot).
+
+## 3. Concurrency — decode only (18 Sept, 512-token prompts, 300 generated tokens per stream, 160 W)
+
+`perf3 --conc N`: N streams started together; "overlapped decode" = Σ of each stream's own decode rate (the streams' decode windows overlap almost entirely with 512-token prompts); "wall" divides all generated tokens by the wall time including the serialised prefills.
+
+| configuration | c=1 | c=4 overlapped (wall) | c=8 overlapped (wall) |
+|---|---|---|---|
+| **leapdragon + MoE HIP + cudagraphs, no MTP** | 48.8 | **157** (127) — 39 per stream | **242** (184) — 30 per stream |
+| leapdragon + MoE HIP + cudagraphs + MTP k=2 | 62.5 | 53 (48) — 13 per stream | 90 (77) — 11 per stream |
+
+Rule: MTP k=2 for a single user; from two streams on, serve without MTP. The MTP batch collapse (~180 ms per step at c=4 vs 25 ms without MTP) is under investigation (suspected eager fallback of the speculative shapes). For reference, leapdragon TP4+EP reports 64 → 127 tok/s at 12 streams and Minachist (3× RTX 3090, PP3) 60 → 155 at 4.
+
+## 3a. Older concurrency numbers (17 Sept, 4 streams, 4K prompts, 200 tokens each — prefill-contaminated, kept for the record)
 
 | stack | aggregate tok/s | per stream | mean TTFT |
 |---|---|---|---|

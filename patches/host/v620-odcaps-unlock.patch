@@ -1,0 +1,29 @@
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+@@ -502,6 +502,26 @@
+ 		}
+ 	}
+ 
++	/*
++	 * V620 (PCI subsystem 0x0e34, same match as the power-cap fix): the VBIOS
++	 * PowerPlay table carries a complete OverDrive section (GFXCLK 500-2650 MHz,
++	 * UCLK 674-1075 MHz, power limit +-10 %) but ships with every capability
++	 * flag cleared, so pp_od_clk_voltage only exposes the voltage offset.
++	 * Set the first four flags in the driver's copy of the table — the in-memory
++	 * equivalent of patching overdrive_table.cap[0..3] in the ROM image
++	 * (Tamalero/amd-v620-soft-unlock). Nothing is written back to the SMU or the
++	 * card; the unlock disappears with the module.
++	 */
++	if (adev->pdev->subsystem_device == 0x0e34) {
++		struct smu_11_0_7_powerplay_table *ppt = smu->smu_table.power_play_table;
++
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_GFXCLK_LIMITS] = 1;
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_GFXCLK_CURVE] = 1;
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_UCLK_LIMITS] = 1;
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_POWER_LIMIT] = 1;
++		dev_info(adev->dev, "V620: OverDrive caps GFXCLK/UCLK/POWER enabled in the driver pptable copy\n");
++	}
++
+ 	return 0;
+ }
+ 

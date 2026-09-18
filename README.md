@@ -19,7 +19,9 @@ PP=3 / TP=1 (nothing in this model divides by 3, so TP is impossible), fp16, AWQ
 | leapdragon + **opengfx1030 MoE HIP kernel** (this repo) | 1 201 / 1 794 / — / — | 48 | — |
 | **leapdragon + MoE HIP + cudagraphs + MTP k=2 + prefix caching** | **1 078 / 1 863 / 1 989 / 2 493** | **57–63** | **262K** (1 full request) |
 
-The last line ran 30 minutes of random-size/burst traffic at 131K context (134 iterations, 0 errors, 0 corrupted outputs), 4-stream bursts clean, and a 262K server (KV pool 293K tokens at `--kv-cache-memory-bytes 3.5e9`, VRAM 33.2 / 32.2 / 32.1 GB). Decode above 32K is measured on the streaming client and should be confirmed with server counters; the 261K prefill figure (2 716 tok/s) was taken with prefix caching on and may include partial hits. Full tables: [`docs/RESULTS.md`](docs/RESULTS.md).
+Multi-stream, decode only (512-token prompts, 18 Sept): **without MTP 48.8 → 157 tok/s at 4 streams → 242 at 8**; with MTP k=2 62.5 → 53 → 90 — so MTP for one user, plain cudagraphs from two streams on. A 200 W power cap adds +11–13 % prefill (decode unchanged). See [`docs/RESULTS.md`](docs/RESULTS.md) §2b–3 for what else was tried (k=3, P2P level, batched tokens, memory clock) and why 262K is the ceiling.
+
+The combined line ran 30 minutes of random-size/burst traffic at 131K context (134 iterations, 0 errors, 0 corrupted outputs), 4-stream bursts clean, and a 262K server (KV pool 293K tokens at `--kv-cache-memory-bytes 3.5e9`, VRAM 33.2 / 32.2 / 32.1 GB). Decode above 32K is measured on the streaming client and should be confirmed with server counters; the 261K prefill figure (2 716 tok/s) was taken with prefix caching on and may include partial hits. Full tables: [`docs/RESULTS.md`](docs/RESULTS.md).
 
 ## What is in here
 
