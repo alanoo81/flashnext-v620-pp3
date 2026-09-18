@@ -1,0 +1,60 @@
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c	2026-06-27 12:07:41.000000000 +0200
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c	2026-09-18 14:29:57.601135950 +0200
+@@ -501,6 +501,32 @@
+ 		}
+ 	}
+ 
++	/*
++	 * V620 (PCI subsystem 0x0e34, same match as the power-cap fix): the VBIOS
++	 * PowerPlay table carries a complete OverDrive section (GFXCLK 500-2650 MHz,
++	 * UCLK 674-1075 MHz, power limit +-10 %) but ships with every capability
++	 * flag cleared, so pp_od_clk_voltage only exposes the voltage offset.
++	 * Set the first four flags in the driver's copy of the table — the in-memory
++	 * equivalent of patching overdrive_table.cap[0..3] in the ROM image
++	 * (Tamalero/amd-v620-soft-unlock). Nothing is written back to the SMU or the
++	 * card; the unlock disappears with the module.
++	 */
++	if (adev->pdev->subsystem_device == 0x0e34) {
++		struct smu_11_0_7_powerplay_table *ppt = smu->smu_table.power_play_table;
++
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_GFXCLK_LIMITS] = 1;
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_GFXCLK_CURVE] = 1;
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_UCLK_LIMITS] = 1;
++		ppt->overdrive_table.cap[SMU_11_0_7_ODCAP_POWER_LIMIT] = 1;
++		/*
++		 * Exploration above the VBIOS UCLK ceiling (1075 MHz): widen the driver-side
++		 * OverDrive range only; the SMU may still clamp. Nothing persistent.
++		 */
++		if (ppt->overdrive_table.max[SMU_11_0_7_ODSETTING_UCLKFMAX] < 1250)
++			ppt->overdrive_table.max[SMU_11_0_7_ODSETTING_UCLKFMAX] = 1250;
++		dev_info(adev->dev, "V620: OverDrive caps GFXCLK/UCLK/POWER enabled, UCLK max widened to %u MHz in the driver pptable copy\n", ppt->overdrive_table.max[SMU_11_0_7_ODSETTING_UCLKFMAX]);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -670,6 +696,24 @@
+ 	if (min_power_limit) {
+ 		*min_power_limit = power_limit * (100 - od_percent_lower);
+ 		*min_power_limit /= 100;
++
++		/*
++		 * V620 powerfix (BlivionIaG/v620_toolbox): clamp the minimum PPT
++		 * limit from the VBIOS-declared 250 W to 120 W on Radeon PRO V620
++		 * so userspace can power-cap below 250 W.
++		 *
++		 * Match is on PCI subsystem_device 0x0e34 — uniquely identifies
++		 * the AMD V620 reference board, machine-independent.
++		 */
++		if (smu->adev->pdev->vendor == 0x1002 &&
++		    smu->adev->pdev->device == 0x73a1 &&
++		    smu->adev->pdev->subsystem_vendor == 0x1002 &&
++		    smu->adev->pdev->subsystem_device == 0x0e34 &&
++		    *min_power_limit > 120U) {
++			*min_power_limit = 120U;
++			dev_notice(smu->adev->dev,
++				   "V620 powerfix: allowing PPT limit down to 120 W\n");
++		}
+ 	}
+ 	return 0;
+ }

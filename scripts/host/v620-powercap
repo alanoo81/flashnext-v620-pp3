@@ -1,0 +1,24 @@
+#!/bin/bash
+# Applique le power cap aux 3 V620 (nécessite le module amdgpu patché « V620 powerfix »
+# qui abaisse le plancher de 250 W → 120 W ; cf. /root/V620-NOTES.md).
+# Usage: v620-powercap [watts]   (défaut 160, plage patchée 120-250)
+W="${1:-160}"; UW=$((W * 1000000))
+rc=1
+for i in $(seq 1 30); do
+    ok=0; total=0
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$h/name" 2>/dev/null)" = "amdgpu" ] || continue
+        d="$(readlink -f "$h/device")"
+        [ "$(cat "$d/device" 2>/dev/null)" = "0x73a1" ] || continue
+        total=$((total+1))
+        if echo "$UW" > "$h/power1_cap" 2>/dev/null; then
+            ok=$((ok+1))
+            echo "v620-powercap: $(basename $d): cap = ${W} W"
+        else
+            echo "v620-powercap: $(basename $d): ÉCHEC (min=$(cat $h/power1_cap_min 2>/dev/null))"
+        fi
+    done
+    [ "$total" -gt 0 ] && [ "$ok" = "$total" ] && { rc=0; break; }
+    sleep 2
+done
+exit $rc

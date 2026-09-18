@@ -1,0 +1,70 @@
+#!/bin/bash
+# Réglages OverDrive des Radeon Pro V620 : undervolt GPU (OD_VDDGFX_OFFSET) + horloge mémoire (OD_MCLK).
+# Les deux vivent dans la même table OverDrive et sont validés par le même "c" : un seul commit par carte.
+# Usage: gpu-undervolt apply|reset|status
+#
+# 2026-09-01 : -40 mV (marge de sécurité ; -50 validé 262K/22 min, y compris à 200 W/90 °C). -75 mV = APERTURE_VIOLATION 3/3
+# au-delà de ~10 min de charge continue (OK jusqu à 160K). Marchah : -100 stable SUR LEUR silicium.
+# 2026-09-18 : VRAM 1075 MHz (défaut 1000) = plafond OverDrive du VBIOS, validé memtest_vulkan 5 min 30 par carte, 0 erreur,
+# +7,3 % de débit mémoire, +3,9 % de décode. NE PAS MONTER SANS REVALIDER : au criblage 90 s, card0 (63:00) perd du débit à 1125
+# (retransmissions EDR) et card1 (43:00) plante à 1150 (DEVICE_LOST puis SMU bloqué → reboot hôte obligatoire).
+# OD_MCLK n'existe qu'avec le module amdgpu patché "V620 odcaps" (/lib/modules/$KREL/extra/amdgpu.ko) : sans lui
+# (p. ex. après une mise à jour du noyau) l'horloge mémoire est ignorée proprement et seul l'undervolt est appliqué.
+OFFSET_MV=-40
+MCLK_MHZ=1075
+MCLK_DEFAULT=1000
+
+log() { echo "gpu-undervolt: $*"; }
+
+wait_od_nodes() {
+    for i in $(seq 1 60); do
+        ls /sys/class/drm/card*/device/pp_od_clk_voltage >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    log "ERREUR: pp_od_clk_voltage indisponible (OverDrive non actif ?)"
+    return 1
+}
+
+# apply_od <offset_mV> <mclk_MHz> : écrit les deux réglages puis committe UNE fois par carte.
+apply_od() {
+    local mv=$1 mclk=$2 rc=0 od card pci tbl
+    for od in /sys/class/drm/card*/device/pp_od_clk_voltage; do
+        card=$(echo "$od" | grep -o 'card[0-9]*')
+        pci=$(basename "$(readlink -f "$(dirname "$od")")")
+        # Garde-fou : ne jamais écrire sur une carte dont le SMU ne répond pas (lecture bornée dans le temps).
+        if ! tbl=$(timeout 5 cat "$od" 2>/dev/null) || [ -z "$tbl" ]; then
+            log "ERREUR: $card ($pci) ne répond pas (SMU bloqué ?) : aucune écriture"
+            rc=1; continue
+        fi
+        if ! echo "vo $mv" > "$od" 2>/dev/null; then
+            log "ERREUR: échec écriture offset sur $card ($pci)"; rc=1; continue
+        fi
+        if echo "$tbl" | grep -q '^OD_MCLK:'; then
+            if ! echo "m 1 $mclk" > "$od" 2>/dev/null; then
+                log "ATTENTION: $card ($pci) refuse mclk ${mclk} MHz (hors OD_RANGE ?) : horloge mémoire inchangée"
+            fi
+        else
+            log "ATTENTION: $card ($pci) n'expose pas OD_MCLK (module amdgpu non patché ?) : horloge mémoire ignorée"
+        fi
+        if echo "c" > "$od" 2>/dev/null; then
+            tbl=$(timeout 5 cat "$od" 2>/dev/null)
+            log "$card ($pci): offset $(echo "$tbl" | grep -A1 '^OD_VDDGFX_OFFSET:' | tail -1 | tr -d ' '), mclk max $(echo "$tbl" | grep -A2 '^OD_MCLK:' | tail -1 | awk '{print $2}')"
+        else
+            log "ERREUR: échec du commit sur $card ($pci)"; rc=1
+        fi
+    done
+    return $rc
+}
+
+case "$1" in
+    apply)  wait_od_nodes && apply_od $OFFSET_MV $MCLK_MHZ ;;
+    reset)  apply_od 0 $MCLK_DEFAULT ;;
+    status)
+        for od in /sys/class/drm/card*/device/pp_od_clk_voltage; do
+            card=$(echo "$od" | grep -o 'card[0-9]*')
+            pci=$(basename "$(readlink -f "$(dirname "$od")")")
+            echo "== $card ($pci) =="
+            timeout 5 cat "$od" || echo "(pas de réponse)"
+        done ;;
+    *) echo "Usage: $0 apply|reset|status"; exit 1 ;;
+esac

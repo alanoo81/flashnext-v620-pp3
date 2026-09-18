@@ -48,11 +48,29 @@ Decode 48 vs 32 on the leapdragon lines: image 20260915 + `VLLM_RDNA_DENSE_INT8=
 | MTP k=3 | 1 075 / 1 841 / 2 003 / 2 511 | 56–67 | wash (2.96 tokens/step at 65 % acceptance), 8 % less KV |
 | `NCCL_P2P_LEVEL=SYS` | 1 078 / 1 847 / 2 008 / 2 510 | 59–65 | −1–2 % (leapdragon's +8 % came from TP all-reduces; PP has none) |
 | `--max-num-batched-tokens 4096` | 903 / 1 406 / 1 484 / 2 105 | 58–65 | −17–27 %, keep 2 048 |
-| memory clock forced to 1 000 MHz (`manual`, `pp_dpm_mclk 3`) | 1 082 / 1 871 / 2 018 / 2 544 | 56–63 | identical: mclk already sits at 1 000 MHz during active phases (0.25 s sampling), the 96 MHz dips are idle gaps |
+| memory clock forced to the top DPM level (`manual`, `pp_dpm_mclk 3`) | 1 082 / 1 871 / 2 018 / 2 544 | 56–63 | identical: mclk already sits there during active phases (0.25 s sampling), the 96 MHz dips are idle gaps |
 | 262K ctx, `--kv-cache-memory-bytes 4.5e9` | 1 862 (131K) / 1 247 (261K) | — | KV 377K tokens = 1.44 full requests, GPU0 holds |
 | 262K ctx, no MTP, KV auto (0.95) | boot fails | — | profiler leaves 2.2 GiB < 2.21 needed — always pin the KV size |
 
-Memory clock: GDDR6 DPM levels 96 / 456 / 673 / 1 000 MHz, no `OD_MCLK` in the OverDrive table of this VBIOS (only `OD_VDDGFX_OFFSET`). An in-driver unlock of the OverDrive capability flags (the same four bytes as [Tamalero/amd-v620-soft-unlock](https://github.com/Tamalero/amd-v620-soft-unlock) flips in the ROM, done in `sienna_cichlid_patch_pptable_quirk` for subsystem `0x0e34`) builds cleanly against the patched amdgpu; it would expose UCLK 674–1 075 MHz — not yet applied (needs a host reboot).
+## 2c. VRAM clock (18 Sept, afternoon)
+
+GDDR6 DPM levels are 96 / 456 / 673 / 1 000 MHz and the stock driver exposes no `OD_MCLK` on the V620: the VBIOS PowerPlay table carries a complete OverDrive section (GFXCLK 500–2 650, UCLK 674–1 075 MHz) with every capability flag cleared. `patches/host/v620-amdgpu-powercap-odcaps-uclk1250.patch` sets the four flags in the **driver's copy** of the table for PCI subsystem `0x0e34` (the in-driver equivalent of the four ROM bytes [Tamalero/amd-v620-soft-unlock](https://github.com/Tamalero/amd-v620-soft-unlock) flips through QEMU `romfile=`; we run LXC on the host driver, so no romfile) and widens the driver-side UCLK ceiling to 1 250 MHz for exploration. Nothing is written to the card; it needs a module rebuild and a host reboot.
+
+Tested with `memtest_vulkan` v0.5.0, one card at a time (`scripts/host/vram-clk-climb.sh`, `scripts/host/mtv.py`). Write throughput in GB/s:
+
+| card (bus) | 1 000 | 1 075 | 1 100 | 1 125 | 1 150 |
+|---|---|---|---|---|---|
+| card0 (63:00) | 448 | **481** | 490 | 478 — throughput drops, no data error (EDR link retries) | — |
+| card2 (46:00) | — | **479** | 487 | 499 | 508, still tracking the clock; not pushed further |
+| card1 (43:00) | — | **476** | 476 | 490 | `ERROR_DEVICE_LOST` (gfx ring timeout) |
+
+**Only 1 075 MHz is validated**: 5 min 30 per card, twice (before and after the incident below), 0 errors, +7.4 % memory throughput on card0 (the only card with a verified 1 000 MHz reference: the earlier reference passes on the other two had silently tested card0, see the pitfalls below), memory at 62–64 °C on these passive cards. Everything above 1 075 is a single 90-second screening pass, and the 90-second throughput figure is noisier than it looks (card1 read 476 at both 1 075 and 1 100, then 490 at 1 125). The SMU firmware does not clamp above the VBIOS ceiling — throughput follows the clock — and the three cards do not have the same margin.
+
+Serving effect of 1 075 MHz, same configuration as §3: decode without MTP 48.8 → **50.7 tok/s (+3.9 %)**, with MTP k=2 and the quantised drafter 64.9 / 66.3 → 68.0 / 67.2, c=4 staggered 160 → 163. Forcing the memory clock to the top DPM level (`manual`, `pp_dpm_mclk 3`) changes nothing: it already sits there during active phases. In PP=3 the stages run in series for each token, so a per-card setting (1 100 / 1 075 / 1 125) would buy well under 1 % — we run **1 075 on all three**, made persistent by `scripts/host/gpu-undervolt` (voltage offset and memory clock live in the same OverDrive table: both are written, then committed **once** per card).
+
+**Incident, for anyone repeating this.** When card1 hung at 1 150 the driver's ring reset succeeded (`device wedged, but recovered through reset`). Our script then wrote an OverDrive setting to that freshly reset card — it only `break`-ed out of its climb loop and carried on — and six seconds later the SMU stopped answering (`SMU: No response msg_reg: 29`, sysfs silent, a process stuck in D state in `amdgpu_dpm_get_sclk`). There is no FLR on these cards: host reboot. The script in this repo now exits without any OverDrive write on a memtest error or any amdgpu ring-timeout / reset / wedged / SMU message, and `gpu-undervolt` reads the table with a timeout before writing. **After a GPU hang, write nothing to `pp_od_clk_voltage` until the host has rebooted.**
+
+`memtest_vulkan` pitfalls here: it ignores the device choice on stdin, as a CLI argument and via `DRI_PRIME` (always tests the first card) — drive it through a pseudo-terminal (`mtv.py`) and check the `Bus=` it reports; concurrent instances fail with `Failed determining memory budget`; a backgrounded instance ignores `SIGINT`. Memory voltage: the OverDrive table sent to the SMU has a single voltage field (`VddGfxOffset`); `MemMvddVoltage[]` / `MemVddciVoltage[]` exist in the PowerPlay table but there is no memory-voltage sensor and we did not touch them.
 
 ## 3. Concurrency — decode only (18 Sept, 512-token prompts, 300 generated tokens per stream, 160 W)
 
