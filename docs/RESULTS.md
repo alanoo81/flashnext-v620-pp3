@@ -162,6 +162,19 @@ The combined configuration's 4-stream bursts (2 808 / 3 783 / 4 776 / 713-token 
 | fused MoE | `moe_gemm_q4_kernel_rdna2` **582 ms** | `fused_moe_kernel_gptq_awq` **3 849 ms** |
 | everything else | within noise | within noise |
 
+## 6b. Where a decode step goes (18 Sept evening, single stream, no MTP, cudagraphs, torch profiler on all three ranks)
+
+`scripts/test-prof-dec-leap.sh`, `decstep.py`, `timeline.py`, `kern.py`. One step = 19.6 ms (51 tok/s; 23.4 ms under the profiler).
+
+- The three stages run strictly in series and the **stage-to-stage handoff is 0.03 ms** — PCIe / P2P is not what limits decode. The "60 % NCCL" in a per-rank summary is the receive kernel spinning while the other stages compute.
+- Each stage keeps the GPU busy ~5.4 ms inside a ~6.4 ms slot (7.6 under the profiler): 574 kernels per step per stage, replayed by hipGraph with launch gaps; rank 0 adds ~1 ms of lead-in (scheduler output, PLE lookup). Compute is 16.2 of the 19.6 ms.
+- Per stage: **dense int8 GEMV 2.05 ms (37 %)**, MoE q4 GEMM 1.10 ms (20 %), hyper-connection int8 kernels ~0.7 ms, shared expert ~0.35 ms, GDN recurrent 0.24 ms, top-k gating 0.17 ms, `moe_align_block_size` 0.06 ms (not worth touching).
+- The dense GEMVs are the projections the AWQ checkpoint leaves in bf16 (`linear_attn.in_proj_qkv` 10240×2560, `in_proj_z` / `out_proj` 6144×2560, `self_attn.q_proj` 12288×2560), served from leapdragon's int8 shadows and purely bandwidth-bound: 57 µs for a 26 MB matrix ≈ 460 GB/s. About 2.9 GB of dense weights are read per token against ~1 GB of expert weights.
+
+So the remaining decode lever is weight bytes, not kernels or interconnect: int4 (group 128) for those projections would remove ~3 ms per step (≈ 60 tok/s without MTP). No int4 dense path exists in either tree (leapdragon's kernels are `RowI8` only), and these layers were left unquantised on purpose — it needs a kernel, an offline quantiser and a perplexity check. Not done.
+
+**TunableOp tuned for PP3 shapes: no gain.** leapdragon's rows were tuned under TP4; seven TP1 shapes were missing at N=2048 (8192×2560, 5120×2560, 2560×6144, …). `TUNEOP=tune` (40 min, `scripts/tune-pp3.sh`) added 214–268 rows per rank; A/B in one session: prefill 1 154 → 1 170 (4K), 1 770 → 1 764 (16K), decode 50.9 → 50.9, MTP decode within run-to-run noise.
+
 ## 7. MTP directly on opengfx1030 (worktree on `50120e1`, PP3, eager, cache off, 4K / 16K)
 
 | runner | MTP | decode tok/s | acceptance |

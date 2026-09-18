@@ -17,6 +17,13 @@ if [ "${TUNEOP:-0}" = 1 ]; then
   COMMON+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=0 -e PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
     -e PYTORCH_TUNABLEOP_FILENAME=/app/vllm/tunableop/rocblas-9847aecc4bf8/tunableop_results.csv)
 fi
+# TUNEOP=tune : autotune de chaque nouvelle forme de GEMM (formes PP3/TP1, absentes des rangées TP4 de leapdragon), rangées
+# écrites dans $CACHE/tunableop/pp3/ (amorcé par tune-pp3.sh avec les rangées de l image). TUNEOP=pp3 : lookup-only sur ces rangées.
+if [ "${TUNEOP:-0}" = tune ] || [ "${TUNEOP:-0}" = pp3 ]; then
+  T=0; [ "$TUNEOP" = tune ] && T=1
+  COMMON+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=$T -e PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
+    -e PYTORCH_TUNABLEOP_VERBOSE=${TUNEOP_VERBOSE:-0} -e PYTORCH_TUNABLEOP_FILENAME=/cache/tunableop/pp3/tunableop_results.csv)
+fi
 # tailles de capture piecewise pour les lots de prefill (leapdragon §8e) — CG_SIZES="1 2 4 8 16 32 64 128 256"
 [ -n "${CG_SIZES:-}" ] && EXTRA="$EXTRA --cudagraph-capture-sizes $CG_SIZES"
 if [ "${UPSTREAM_ENV:-0}" = 1 ]; then   # pile d environnement de scripts/serve_gfx1030_full.sh (opengfx1030)
