@@ -12,18 +12,25 @@ COMMON=(--device /dev/kfd --device /dev/dri --group-add 993 --group-add 44 --ipc
   -e VLLM_CACHE_ROOT=/cache/compile -e TRITON_CACHE_DIR=/cache/triton -e PYTORCH_ROCM_ARCH=gfx1030
   -e V620_GDN_TRITON -e V620_MOE_TRITON -e VLLM_RDNA_DENSE_GEMV -e VLLM_GDN_HIP_PREFILL -e V620_RMS_C -e VLLM_RDNA_DENSE_INT8=${DENSE_INT8:-1} -e VLLM_RDNA_DENSE_INT8_ONLY=${DENSE_INT8_ONLY:-0} -e VLLM_ROCM_MOE_PADDING=${MOE_PADDING:-1} -e VLLM_DISABLE_COMPILE_CACHE=0 -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS -e PYTORCH_CUDA_ALLOC_CONF -e VLLM_QSA_KV_OFFLOAD -e VLLM_QSA_KV_OFFLOAD_MAX_GIB -e VLLM_QSA_KVO_ARENA -e V620_MOE_HIP=${MOE_HIP:-0} ${PART:+-e VLLM_PP_LAYER_PARTITION=$PART} ${V2RUNNER:+-e VLLM_USE_V2_MODEL_RUNNER=$V2RUNNER}
   -v $MODEL:/model -v $PLE:/ples_int4 -v $CACHE:/cache)
-# leapdragon serve-qwen38-flash-next.sh : TunableOp lookup-only (rangées rocBLAS de l image, sha 9847aecc4bf8) — TUNEOP=1
-if [ "${TUNEOP:-0}" = 1 ]; then
-  COMMON+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=0 -e PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
-    -e PYTORCH_TUNABLEOP_FILENAME=/app/vllm/tunableop/rocblas-9847aecc4bf8/tunableop_results.csv)
-fi
-# TUNEOP=tune : autotune de chaque nouvelle forme de GEMM (formes PP3/TP1, absentes des rangées TP4 de leapdragon), rangées
-# écrites dans $CACHE/tunableop/pp3/ (amorcé par tune-pp3.sh avec les rangées de l image). TUNEOP=pp3 : lookup-only sur ces rangées.
-if [ "${TUNEOP:-0}" = tune ] || [ "${TUNEOP:-0}" = pp3 ]; then
-  T=0; [ "$TUNEOP" = tune ] && T=1
-  COMMON+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=$T -e PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
-    -e PYTORCH_TUNABLEOP_VERBOSE=${TUNEOP_VERBOSE:-0} -e PYTORCH_TUNABLEOP_FILENAME=/cache/tunableop/pp3/tunableop_results.csv)
-fi
+# TunableOp (GEMM rocBLAS), rangées liées au build rocBLAS de l image leapdragon 0915 (sha 9847aecc4bf8) -> TREE=image seulement.
+#   TUNEOP=1 (défaut avec TREE=image) : lookup-only sur NOS rangées PP3/TP1 = rangées leapdragon (réglées en TP4) + les formes
+#             TP1 qui leur manquaient ; source versionnée $OVERLAY/tunableop-pp3/, copiée dans $CACHE/tunableop/pp3/ si absente
+#   TUNEOP=leap : lookup-only sur les rangées d origine de l image      TUNEOP=tune : règle toute forme nouvelle (scripts/tune-pp3.sh)
+#   TUNEOP=0 : désactivé
+OVERLAY=${OVERLAY:-/root/vllm-leap-img}
+[ "$TREE" = image ] && TUNEOP=${TUNEOP:-1}; [ "${TUNEOP:-0}" = pp3 ] && TUNEOP=1
+case "${TUNEOP:-0}" in
+  leap) COMMON+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=0 -e PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
+          -e PYTORCH_TUNABLEOP_FILENAME=/app/vllm/tunableop/rocblas-9847aecc4bf8/tunableop_results.csv) ;;
+  1|tune)
+    T=0; [ "$TUNEOP" = tune ] && T=1
+    mkdir -p $CACHE/tunableop/pp3
+    for r in 0 1 2; do [ -s $CACHE/tunableop/pp3/tunableop_results$r.csv ] || cp $OVERLAY/tunableop-pp3/tunableop_results$r.csv $CACHE/tunableop/pp3/ 2>/dev/null; done
+    if [ "$T" = 1 ] || [ -s $CACHE/tunableop/pp3/tunableop_results0.csv ]; then
+      COMMON+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=$T -e PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
+        -e PYTORCH_TUNABLEOP_VERBOSE=${TUNEOP_VERBOSE:-0} -e PYTORCH_TUNABLEOP_FILENAME=/cache/tunableop/pp3/tunableop_results.csv)
+    else echo "TunableOp : rangées PP3 introuvables ($OVERLAY/tunableop-pp3), désactivé" >&2; fi ;;
+esac
 # tailles de capture piecewise pour les lots de prefill (leapdragon §8e) — CG_SIZES="1 2 4 8 16 32 64 128 256"
 [ -n "${CG_SIZES:-}" ] && EXTRA="$EXTRA --cudagraph-capture-sizes $CG_SIZES"
 if [ "${UPSTREAM_ENV:-0}" = 1 ]; then   # pile d environnement de scripts/serve_gfx1030_full.sh (opengfx1030)

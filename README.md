@@ -50,14 +50,14 @@ docker run --rm -v $PWD/rdna2-moe:/build -w /build --entrypoint bash \
 cp rdna2-moe/v620_moe_rdna2.so overlay/vllm/v620_moe_rdna2.so     # the launcher mounts it at /app/vllm/vllm/
 
 # 2. serve — scripts/vllm-pp3.sh mounts every overlay/vllm/**/*.py|json|so over /app/vllm
-MOE_HIP=1 TUNEOP=1 CG_SIZES="1 2 4 8 16 32 64 128 256" \
+MOE_HIP=1 CG_SIZES="1 2 4 8 16 32 64 128 256" \
 IMG=ghcr.io/leapdragon/vllm-rdna2-qwen:20260915-g1bdbbef4b TREE=image \
 DENSE_INT8=1 DENSE_INT8_ONLY=1 MOE_PADDING=0 PART=17,18,13 CTX=131072 \
 EXTRA='--kv-cache-memory-bytes 3500000000 --speculative-config {"method":"mtp","num_speculative_tokens":2}' \
 scripts/vllm-pp3.sh start
 ```
 
-Knobs (all in `scripts/vllm-pp3.sh`): `MOE_HIP=1` opengfx1030 MoE kernel (default off → leapdragon's Triton path); `TUNEOP=1` rocBLAS TunableOp lookup-only with the rows shipped in the image (`tunableop/rocblas-9847aecc4bf8`); `CG_SIZES` piecewise CUDA-graph capture sizes for prefill batches (leapdragon §8e); `PART` = `VLLM_PP_LAYER_PARTITION` (17,18,13 with the MTP drafter on the last stage; 18,17,13 without); `EAGER=1`, `NOPC="--no-enable-prefix-caching"`, `P2P=` (`NCCL_P2P_LEVEL`, PHB here: no shared PCIe switch, PXB disables P2P).
+Knobs (all in `scripts/vllm-pp3.sh`): `MOE_HIP=1` opengfx1030 MoE kernel (default off → leapdragon's Triton path); TunableOp (rocBLAS GEMM rows) is **on by default** with `TREE=image`, lookup-only, on the rows in `overlay/tunableop-pp3/` — leapdragon's rows (tuned under TP4) plus the TP1 shapes they lacked (8192×2560, 5120×2560, 2560×6144, … and every capture size), tuned on this PP3 setup with `scripts/tune-pp3.sh`; the rows are tied to the rocBLAS build of image `20260915-g1bdbbef4b` (sha `9847aecc4bf8`) — `TUNEOP=leap` uses the image's original rows, `TUNEOP=tune` re-tunes, `TUNEOP=0` disables. Measured gain over leapdragon's rows: none beyond noise (RESULTS §6b), kept as the default because this repo is PP3-specific and the rows match the shapes actually run; `CG_SIZES` piecewise CUDA-graph capture sizes for prefill batches (leapdragon §8e); `PART` = `VLLM_PP_LAYER_PARTITION` (17,18,13 with the MTP drafter on the last stage; 18,17,13 without); `EAGER=1`, `NOPC="--no-enable-prefix-caching"`, `P2P=` (`NCCL_P2P_LEVEL`, PHB here: no shared PCIe switch, PXB disables P2P).
 
 Edit `MODEL`, `PLE`, `CACHE` at the top of the launcher for your paths. The launcher expects the overlay at `/root/vllm-leap-img` — set `OVERLAY=` or symlink.
 

@@ -173,7 +173,7 @@ The combined configuration's 4-stream bursts (2 808 / 3 783 / 4 776 / 713-token 
 
 So the remaining decode lever is weight bytes, not kernels or interconnect: int4 (group 128) for those projections would remove ~3 ms per step (≈ 60 tok/s without MTP). No int4 dense path exists in either tree (leapdragon's kernels are `RowI8` only), and these layers were left unquantised on purpose — it needs a kernel, an offline quantiser and a perplexity check. Not done.
 
-**TunableOp tuned for PP3 shapes: no gain.** leapdragon's rows were tuned under TP4; seven TP1 shapes were missing at N=2048 (8192×2560, 5120×2560, 2560×6144, …). `TUNEOP=tune` (40 min, `scripts/tune-pp3.sh`) added 214–268 rows per rank; A/B in one session: prefill 1 154 → 1 170 (4K), 1 770 → 1 764 (16K), decode 50.9 → 50.9, MTP decode within run-to-run noise.
+**TunableOp tuned for PP3 shapes: no gain.** leapdragon's rows were tuned under TP4; seven TP1 shapes were missing at N=2048 (8192×2560, 5120×2560, 2560×6144, …). `TUNEOP=tune` (40 min, `scripts/tune-pp3.sh`) added 214–268 rows per rank; A/B in one session: prefill 1 154 → 1 170 (4K), 1 770 → 1 764 (16K), decode 50.9 → 50.9, MTP decode within run-to-run noise. The PP3 rows are nevertheless the launcher's default (`overlay/tunableop-pp3/`): they are a superset of leapdragon's and match the shapes this setup runs.
 
 ## 7. MTP directly on opengfx1030 (worktree on `50120e1`, PP3, eager, cache off, 4K / 16K)
 
