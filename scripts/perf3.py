@@ -63,9 +63,13 @@ def run_one(p, mx):
     gen = (ctoks - 1) / (t2 - t1) if t1 and t2 > t1 and ctoks > 1 else 0
     return dict(ptoks=ptoks, ttft=ttft, pp=ptoks / ttft if ttft else 0, gen=gen, ctoks=ctoks, out=out, wall=t2 - t0)
 print(f"# {tag} port={port} ngen={ngen} reps={reps}")
-for n in ns:
-    offs = [0, 300000][:reps]
-    if n > 150000: offs = [0]
+for idx, n in enumerate(ns):
+    # Un début de texte différent par taille ET par répétition : le cache de préfixes est indexé sur le préfixe,
+    # donc un décalage de quelques caractères suffit à interdire tout hit entre tailles (biais trouvé le 18/09 :
+    # avec --reps 1 toutes les tailles partaient de l'offset 0, comme la sonde sweep.py).
+    base = 997 * (idx + 1)
+    offs = [base, base + 300000][:reps]
+    if n > 150000: offs = [base]
     res = []
     for k, off in enumerate(offs):
         try:

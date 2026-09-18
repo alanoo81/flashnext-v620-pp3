@@ -7,7 +7,7 @@
 
 Nothing here is a fork of either repo: it is the **delta** (overlay files, patches, kernel extension, harness, reports) needed to reproduce the configuration below on three V620s in pipeline parallel, plus the full record of how we got there. Everything is Apache-2.0 like the trees it comes from; the HIP kernel and its Python method are opengfx1030's code, the serving tree is leapdragon's.
 
-## The result (17 Sept, evening)
+## The result (17–18 Sept)
 
 PP=3 / TP=1 (nothing in this model divides by 3, so TP is impossible), fp16, AWQ-W4A16 checkpoint (`wtdcode`), int4 n-gram sidecar in host RAM, power cap 160 W per card.
 
@@ -17,11 +17,14 @@ PP=3 / TP=1 (nothing in this model divides by 3, so TP is impossible), fp16, AWQ
 | opengfx1030 `50120e1` + our fix, eager, cache off | 1 010 / 1 568 / 1 798 / 1 829 | 25–26 | 262K ×2 |
 | leapdragon + tuned int4 MoE config `E=512` + TunableOp | 747 / 1 109 / — / — | 48 | — |
 | leapdragon + **opengfx1030 MoE HIP kernel** (this repo) | 1 201 / 1 794 / — / — | 48 | — |
-| **leapdragon + MoE HIP + cudagraphs + MTP k=2 + prefix caching** | **1 078 / 1 863 / 1 989 / 2 493** | **57–63** | **262K** (1 full request) |
+| **leapdragon + MoE HIP + cudagraphs + MTP k=2** (W4A16 drafter, VRAM 1 075 MHz, 160 W) | **1 152 / 1 705 / 1 936 / 1 933** | **62–68** | **262K** (1 full request) |
+| same at a **200 W** cap | **1 306 / 1 943 / 2 221 / 2 254** | 62–68 | 262K |
 
-Multi-stream, decode only (512-token prompts, 18 Sept): **without MTP 48.8 → 157 tok/s at 4 streams → 242 at 8**; with MTP k=2 62.5 → 159 at 4 (staggered arrivals; simultaneous arrivals lock-step into one batch and give 56) → 91 at 8; with the MTP drafter's experts quantised to W4A16 (`scripts/quant_mtp_experts.py`, same HIP kernel) 65–66 single stream, 160 at 4, 123 wall at 8 — so MTP k=2 (quantised drafter) up to ~4–8 streams, plain cudagraphs for more. A 200 W power cap adds +11–13 % prefill (decode unchanged); VRAM at 1 075 MHz (driver-side OverDrive unlock, `patches/host/`) adds +3.9 % decode — the only memory clock validated on all three cards, see RESULTS §2c before going higher. See [`docs/RESULTS.md`](docs/RESULTS.md) §2b–3 for what else was tried (k=3, P2P level, batched tokens, memory clock) and why 262K is the ceiling.
+> **Correction (18 Sept).** This table first showed 1 078 / 1 863 / 1 989 / 2 493 for the combined line. Those prefill figures were taken with prefix caching on by a harness that started every prompt size at the same corpus offset, so the ≥ 16K values included cache hits. The line above is the clean re-measurement (cache off, one prompt per size). Details and the full current-state table: [`docs/RESULTS.md`](docs/RESULTS.md) §0.
 
-The combined line ran 30 minutes of random-size/burst traffic at 131K context (134 iterations, 0 errors, 0 corrupted outputs), 4-stream bursts clean, and a 262K server (KV pool 293K tokens at `--kv-cache-memory-bytes 3.5e9`, VRAM 33.2 / 32.2 / 32.1 GB). Decode above 32K is measured on the streaming client and should be confirmed with server counters; the 261K prefill figure (2 716 tok/s) was taken with prefix caching on and may include partial hits. Full tables: [`docs/RESULTS.md`](docs/RESULTS.md).
+Multi-stream, decode only (512-token prompts, 18 Sept): **without MTP 48.8 → 157 tok/s at 4 streams → 242 at 8**; with MTP k=2 62.5 → 159 at 4 (staggered arrivals; simultaneous arrivals lock-step into one batch and give 56) → 91 at 8; with the MTP drafter's experts quantised to W4A16 (`scripts/quant_mtp_experts.py`, same HIP kernel) 65–68 single stream, 160–173 at 4, ~90 wall at 8 (+17 % over the bf16 drafter; an earlier "123" compared two different `--max-num-seqs`) — so MTP k=2 (quantised drafter) up to ~4 streams, plain cudagraphs for more (249 at 8). A 200 W power cap adds +13–17 % prefill (decode unchanged); VRAM at 1 075 MHz (driver-side OverDrive unlock, `patches/host/`) adds +4 % decode — the only memory clock validated on all three cards, see RESULTS §2c before going higher. See [`docs/RESULTS.md`](docs/RESULTS.md) §2b–3 for what else was tried (k=3, P2P level, batched tokens, memory clock) and why 262K is the ceiling.
+
+The combined line ran 30 minutes of random-size/burst traffic at 131K context (134 iterations, 0 errors, 0 corrupted outputs), 4-stream bursts clean, and a 262K server (KV pool 293K tokens at `--kv-cache-memory-bytes 3.5e9`, VRAM 33.2 / 32.2 / 32.1 GB). Decode above 32K is measured on the streaming client and should be confirmed with server counters; no clean prefill figure exists yet at 261K (the earlier 2 716 tok/s included prefix-cache hits). Full tables: [`docs/RESULTS.md`](docs/RESULTS.md).
 
 ## What is in here
 

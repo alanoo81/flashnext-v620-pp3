@@ -1,6 +1,34 @@
-# Measured results — Qwen3.8-Flash-Next, 3× Radeon PRO V620, PP=3 (17 Sept 2026)
+# Measured results — Qwen3.8-Flash-Next, 3× Radeon PRO V620, PP=3 (17–18 Sept 2026)
 
-Harness: `scripts/perf3.py` (prompts cut at the token from one corpus at distinct offsets, greedy, 200–300 generated tokens, client-side TTFT and throughput, single stream unless stated), `scripts/stab.py` (random sizes, 4-stream burst every 6th iteration, seed 1, output sanity classifier), `scripts/burst.py` (4 concurrent streams then the same prompt again), `scripts/cachetest3.py` (same prompt 3× on an idle server, `/metrics` prefix-cache counters). Power cap 160 W per card, undervolt −40 mV. "tok/s" = tokens per second.
+Harness: `scripts/perf3.py` (prompts cut at the token from one corpus, greedy, 200–300 generated tokens, client-side TTFT and throughput, single stream unless stated), `scripts/stab.py` (random sizes, 4-stream burst every 6th iteration, seed 1, output sanity classifier), `scripts/burst.py` (4 concurrent streams then the same prompt again), `scripts/cachetest3.py` (same prompt 3× on an idle server, `/metrics` prefix-cache counters). Power cap 160 W per card, undervolt −40 mV unless stated. "tok/s" = tokens per second.
+
+> **Correction, 18 Sept 17:20 — read this before quoting any prefill number.** Until 18 Sept, `perf3.py` run with `--reps 1` started **every prompt size at corpus offset 0**, and so did the warm-up probe. With prefix caching **on**, each size therefore re-used the blocks of the smaller sizes sent before it, and every cache-on prefill figure at ≥ 16K in this file was inflated (16K: 1 863 published, 1 705 clean; 130K: **2 493 published, 1 933 clean**; the 261K "2 716" is unverified and should be ignored). Affected: the last row of §1 and §2, all of §2b (its *relative* verdicts hold, every line carried the same bias). Not affected: anything measured with the cache off (the §2 ladder, the opengfx1030 rows), all decode and concurrency numbers. §0 below is the clean re-measurement; the harness now uses one offset per size. The real prefill advantage of the combined configuration over opengfx1030 at ~130K is +6 % at 160 W (1 933 vs 1 829), not +36 %.
+
+## 0. Current state — clean campaign, 18 Sept 16:00–17:35
+
+One script (`scripts/host/campaign-1075.sh`), one boot, 13 runs, 0 GPU events: leapdragon 0915 + overlay + MoE HIP + cudagraphs + `DENSE_INT8`, partition 17,18,13, **VRAM 1 075 MHz**, −40 mV, the two power caps back to back. "Ref." = the same measurement at 1 000 MHz / 160 W earlier the same day (§3).
+
+Decode, tok/s — multi-stream as "overlapped (wall)", 512-token prompts, 300 tokens per stream:
+
+| | 1 075 MHz, 160 W | 1 075 MHz, 200 W | ref. 1 000 MHz, 160 W |
+|---|---|---|---|
+| no MTP, 1 stream | **50.9** | 51.1 | 48.8 |
+| no MTP, 4 streams at once | 139.5 (114) | 139.5 (117) | 157 (127) † |
+| no MTP, 8 streams at once (`--max-num-seqs 8`) | **249 (191)** | 253 (195) | 242 (184) |
+| MTP k=2, bf16 drafter, 1 stream (4K / 16K) | 62.8 / 61.8 | 62.6 / 61.3 | 59.8 / 62.5 |
+| MTP k=2, W4A16 drafter, 1 stream (4K / 16K) | **66.2 / 67.9** | 64.9 / 64.4 | 64.9 / 66.3 |
+| MTP k=2, W4A16 drafter, 4 streams 0.7 s apart | **173 (125)** | 166 (126) | 160 (121) |
+| MTP k=2, W4A16 drafter, 8 streams 0.7 s apart, `--max-num-seqs 8` | 112 (90) | 109 (88) | bf16 drafter: 91 (77) |
+
+Prefill, tok/s — MTP k=2 with the W4A16 drafter, ctx 131K, prefix caching **off**, one prompt per size:
+
+| | 4K | 16K | 65K | 130K |
+|---|---|---|---|---|
+| 1 075 MHz, 160 W | 1 152 | 1 705 | 1 936 | 1 933 |
+| 1 075 MHz, 200 W | **1 306** | **1 943** | **2 221** | **2 254** |
+| gain | +13.4 % | +14.0 % | +14.7 % | +16.6 % |
+
+What holds: **200 W = +13–17 % prefill and nothing on decode** (decode is memory-bound, prefill sits at the cap); **1 075 MHz ≈ +4 % decode without MTP** (three samples at 50.7–50.9 vs 48.8); the quantised drafter ≈ +5–10 % single stream and +17 % wall at 8 streams. Single-run MTP figures move by ±5 % from run to run (acceptance varies with the text). † The 4-stream no-MTP figure reproduced at exactly 139.5 on both caps and we cannot explain the gap to the morning's 157 — open. Thermals during the 130K prefill at 200 W: junction ≤ 80 °C, memory ≤ 64 °C (passive cards, server airflow).
 
 ## 1. Single stream, by context depth
 
@@ -23,7 +51,8 @@ Harness: `scripts/perf3.py` (prompts cut at the token from one corpus at distinc
 | **leapdragon + MoE HIP** (this repo), cudagraphs, cache off, E=512 config, TunableOp | decode | — | 48.4 | 48.5 | — | — | — | — |
 | | prefill | — | **1 201** | **1 794** | — | — | — | — |
 | **leapdragon + MoE HIP + MTP k=2**, cudagraphs, cache on, 17,18,13, KV 3.5e9 | decode | — | **57.2** | **62.0** | 58.9 ‡ | 62.8 ‡ | 60.7 ‡ | 63.4 ‡ |
-| | prefill | — | **1 078** | **1 863** | **1 843** | **1 989** | **2 493** | 2 716 § |
+| | prefill (cache on — ≥ 16K inflated, see the correction above) | — | **1 078** | ~~1 863~~ | ~~1 843~~ | ~~1 989~~ | ~~2 493~~ | ~~2 716~~ § |
+| same, W4A16 drafter, VRAM 1 075 MHz, **cache off** (§0) | prefill | — | **1 152** | **1 705** | — | **1 936** | **1 933** | — |
 
 ✱ measured but invalid (the streaming client sees nothing until the end with MTP above ~32K). ‡ streaming measurement on 100 tokens, consistent with 4K/16K, to be confirmed with server counters. § 262K server (KV 293K tokens = 1.12 full requests), prefix caching on during the measurement — may include partial hits; 1 859 at 131K and 1 313 at 200K on the same server.
 
@@ -37,9 +66,11 @@ Decode 48 vs 32 on the leapdragon lines: image 20260915 + `VLLM_RDNA_DENSE_INT8=
 | + leapdragon's tuned int4 MoE config copied to `E=512` (`num_stages=1`) | 689 (+68 %) | 1 032 (+40 %) | 48.1 |
 | + TunableOp lookup (rocBLAS rows in the image) + capture sizes 1…256 | 747 | 1 109 | 48.0 |
 | + opengfx1030 `moe_gptq_gemm_rdna2` as a torch extension | **1 201** | **1 794** | 48.4 |
-| + MTP k=2 + prefix caching (ctx 131K) | 1 078 | 1 863 | 57–63 |
+| + MTP k=2 (ctx 131K, cache off, clean re-measurement §0) | 1 152 | 1 705 | 62–68 |
 
 ## 2b. What else was tried on the combined configuration (18 Sept, 65K ctx, cache on, 4K / 16K / 32K / 60K prompts)
+
+Absolute prefill values at ≥ 16K in this table are inflated by prefix-cache hits (see the correction at the top); every line carried the same bias, so the verdicts stand. The 200 W line was re-measured cleanly in §0: +13–17 %.
 
 | change | prefill tok/s | decode tok/s | verdict |
 |---|---|---|---|
@@ -66,7 +97,7 @@ Tested with `memtest_vulkan` v0.5.0, one card at a time (`scripts/host/vram-clk-
 
 **Only 1 075 MHz is validated**: 5 min 30 per card, twice (before and after the incident below), 0 errors, +7.4 % memory throughput on card0 (the only card with a verified 1 000 MHz reference: the earlier reference passes on the other two had silently tested card0, see the pitfalls below), memory at 62–64 °C on these passive cards. Everything above 1 075 is a single 90-second screening pass, and the 90-second throughput figure is noisier than it looks (card1 read 476 at both 1 075 and 1 100, then 490 at 1 125). The SMU firmware does not clamp above the VBIOS ceiling — throughput follows the clock — and the three cards do not have the same margin.
 
-Serving effect of 1 075 MHz, same configuration as §3: decode without MTP 48.8 → **50.7 tok/s (+3.9 %)**, with MTP k=2 and the quantised drafter 64.9 / 66.3 → 68.0 / 67.2, c=4 staggered 160 → 163. Forcing the memory clock to the top DPM level (`manual`, `pp_dpm_mclk 3`) changes nothing: it already sits there during active phases. In PP=3 the stages run in series for each token, so a per-card setting (1 100 / 1 075 / 1 125) would buy well under 1 % — we run **1 075 on all three**, made persistent by `scripts/host/gpu-undervolt` (voltage offset and memory clock live in the same OverDrive table: both are written, then committed **once** per card).
+Serving effect of 1 075 MHz, same configuration as §3: decode without MTP 48.8 → **50.7–50.9 tok/s (+4 %, three samples)**, with MTP k=2 and the quantised drafter 64.9 / 66.3 → 66–68, c=4 staggered 160 → 163–173 (full table in §0). Forcing the memory clock to the top DPM level (`manual`, `pp_dpm_mclk 3`) changes nothing: it already sits there during active phases. In PP=3 the stages run in series for each token, so a per-card setting (1 100 / 1 075 / 1 125) would buy well under 1 % — we run **1 075 on all three**, made persistent by `scripts/host/gpu-undervolt` (voltage offset and memory clock live in the same OverDrive table: both are written, then committed **once** per card).
 
 **Incident, for anyone repeating this.** When card1 hung at 1 150 the driver's ring reset succeeded (`device wedged, but recovered through reset`). Our script then wrote an OverDrive setting to that freshly reset card — it only `break`-ed out of its climb loop and carried on — and six seconds later the SMU stopped answering (`SMU: No response msg_reg: 29`, sysfs silent, a process stuck in D state in `amdgpu_dpm_get_sclk`). There is no FLR on these cards: host reboot. The script in this repo now exits without any OverDrive write on a memtest error or any amdgpu ring-timeout / reset / wedged / SMU message, and `gpu-undervolt` reads the table with a timeout before writing. **After a GPU hang, write nothing to `pp_od_clk_voltage` until the host has rebooted.**
 
@@ -88,9 +119,9 @@ The MTP "collapse" at c=4 is a scheduling lock-step, not a kernel problem: reque
 | MTP k=2, MoE HIP, cudagraphs | c=1 (4K / 16K) | acceptance | c=4, 0.7 s apart | c=8, 0.7 s apart (wall) |
 |---|---|---|---|---|
 | drafter experts bf16 (Triton) | 59.8 / 62.5 | 70 % (2.41) | 159 (116 wall) | 91 (77) |
-| **drafter experts W4A16 (HIP)** | **64.9 / 66.3** | 75 % (2.50) | 160 (121 wall) | **123 wall** |
+| **drafter experts W4A16 (HIP)** | **64.9 / 66.3** | 75 % (2.50) | 160 (121 wall) | **~110 (88–90 wall)**, two samples |
 
-No measurable acceptance loss (RTN error ~13 % relative on the weights), +4–7 % single stream, +60 % wall throughput at 8 streams (no-MTP at 8 streams, same arrival pattern: 156 wall).
+No measurable acceptance loss (RTN error ~13 % relative on the weights), +4–7 % single stream, **+17 % wall / +23 % overlapped at 8 streams** (no-MTP at 8 streams, same arrival pattern: 156 wall — so beyond ~4 streams, no MTP). *Corrected 18 Sept:* this line first read "123 wall, +60 %"; that run had been launched with `--max-num-seqs 4` against 8 for the bf16 line. Like for like it is 88–90. The acceptance column is the server's rolling counter, indicative only.
 
 Two knobs from Minachist's write-up checked on ROCm: `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` fixes the KV auto-sizing (262K, KV auto: 363K tokens without MTP, 344K with k=2, where the default profiler refused to boot) — use it instead of pinning `--kv-cache-memory-bytes`; `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` breaks the PLE offload worker's cross-process registration on ROCm (`hipErrorInvalidValue`) — do not set it.
 
