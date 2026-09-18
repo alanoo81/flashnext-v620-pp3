@@ -68,7 +68,7 @@ Edit `MODEL`, `PLE`, `CACHE` at the top of the launcher for your paths. The laun
    - TunableOp lookup + capture sizes 1…256: +8 %;
    - **opengfx1030's `moe_gptq_gemm_rdna2`** built as a standalone torch extension (own op namespace `_v620_rdna2`), `CompressedTensorsWNA16RDNA2MoEMethod` (byte-identical to the RDNA3 method already in the leapdragon tree, op relocated, `create_weights` supplies `intermediate_size_full`), a gfx10x branch in `rocm_moe_rdna.py`, and the RDNA2 class name in the two exact-name allow-lists of `routed_experts.py`: 747 → **1 201** at 4K, 1 109 → **1 794** at 16K, decode unchanged.
 
-`patches/leapdragon/overlay-vs-image-20260915-g1bdbbef4b.diff` is the whole overlay as one diff (1 305 lines).
+`patches/leapdragon/overlay-vs-image-20260915-g1bdbbef4b.diff` is the whole overlay as one diff. It also carries the opt-in, currently non-functional QSA host-KV offload port (`VLLM_QSA_KV_OFFLOAD=1`, see JOURNEY 18 Sept) — inert unless the variable is set.
 
 ## What the rdna_extras patches do (opengfx1030 tree)
 
