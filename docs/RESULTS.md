@@ -219,10 +219,10 @@ Simulated weight-only quantisation of the big dense projections (the 37 % of dec
 
 ## 8. VRAM (combined configuration, `--kv-cache-memory-bytes 3.5e9`)
 
-| ctx | KV pool | full requests | VRAM used GPU0 / 1 / 2 |
+| ctx | KV pool | full requests | VRAM used GPU0 / 1 / 2 (GiB, as nvtop / amdgpu_top report it; each card has 32 752 MiB = 31.98 GiB) |
 |---|---|---|---|
 | 65 536 | 219K tokens | 3.3 | — |
-| 131 072 | 263K | 2.0 | 33.7 / 32.6 / 32.4 GB |
-| 262 144 | 293K | 1.12 | 33.2 / 32.2 / 32.1 GB |
+| 131 072 | 263K | 2.0 | 31.4 / 30.4 / 30.2 GiB of 31.98 |
+| 262 144 | 293K | 1.12 | 30.9 / 30.0 / 29.9 GiB of 31.98 |
 
 Weights 23.8 / 24.1 / 25.4 GiB per stage (17,18,13 layers; stage 0 also hosts the PLE connector, stage 2 the MTP drafter). opengfx1030 eager without MTP keeps 546K tokens of KV (two full 262K requests).
