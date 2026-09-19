@@ -1,0 +1,105 @@
+From bd43380148a268a798645c28249fd624bf679b08 Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Tue, 15 Sep 2026 14:02:33 +0000
+Subject: [PATCH 1/6] v620: allow pipeline parallelism with the PLE layer on
+ stage 0 (PP3 on 3x V620)
+
+---
+ vllm/models/qwen4_exp/amd/model_state.py    |  9 ++-------
+ vllm/models/qwen4_exp/nvidia/model_state.py |  9 ++-------
+ vllm/v1/worker/gpu_worker.py                | 22 ++++++++++++++++++---
+ 3 files changed, 23 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/amd/model_state.py b/vllm/models/qwen4_exp/amd/model_state.py
+index ec2a0fef8b..7b2626c247 100644
+--- a/vllm/models/qwen4_exp/amd/model_state.py
++++ b/vllm/models/qwen4_exp/amd/model_state.py
+@@ -32,13 +32,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++        # PP > 1: every rank builds input_ids/ngram_context for its own batch, and
++        # only the stage that holds a PLE layer consumes them (v620-pp3).
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index ec2a0fef8b..7b2626c247 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -32,13 +32,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++        # PP > 1: every rank builds input_ids/ngram_context for its own batch, and
++        # only the stage that holds a PLE layer consumes them (v620-pp3).
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index e0c3fc43a4..bc5879a5a8 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -203,6 +203,13 @@ class Worker(WorkerBase):
+         # Resolved lazily on first sleep/wake; persists worker-process state.
+         self._sleep_mode_backend: SleepModeBackend | None = None
+ 
++    def _model_has_ple_offload_layers(self) -> bool:
++        """Whether the loaded model on this rank contains a PLE offload layer."""
++        from vllm.v1.ple_offload.connector import PleOffloadLayer
++
++        model = self.model_runner.get_model()
++        return any(isinstance(m, PleOffloadLayer) for m in model.modules())
++
+     def _has_ple_layers(self) -> bool:
+         """Return whether this model configuration constructs PLE layers."""
+         if not envs.VLLM_PLE_CPU_OFFLOAD:
+@@ -233,8 +240,8 @@ class Worker(WorkerBase):
+                 f"({parallel_config.data_parallel_size_local}/"
+                 f"{parallel_config.data_parallel_size} local ranks)"
+             )
+-        if parallel_config.pipeline_parallel_size != 1:
+-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
++        # PP is fine as long as the PLE layer(s) sit on the first stage, which
++        # also spawns the offload worker (checked after model load, v620-pp3).
+         if parallel_config.prefill_context_parallel_size != 1:
+             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
+         if parallel_config.decode_context_parallel_size != 1:
+@@ -579,10 +586,19 @@ class Worker(WorkerBase):
+ 
+         # Model loading constructs the PLE placeholders whose CUDA buffers are
+         # registered by the shared MRV1/MRV2 offload client.
+-        if self._ple_offload_enabled:
++        # With pipeline parallelism only the stage(s) holding a PLE layer register
++        # with the worker; the worker is spawned by rank 0 and expects exactly one
++        # registration per TP rank, so the PLE layer must live on stage 0 (v620-pp3).
++        if self._ple_offload_enabled and self._model_has_ple_offload_layers():
+             self.model_runner._setup_ple_offload(
+                 self.parallel_config._ple_offload_ipc_path
+             )
++        elif self._ple_offload_enabled:
++            logger.info(
++                "PleOffload: rank %d holds no PLE layer (PP stage without layer 2); "
++                "no connector on this rank.",
++                self.rank,
++            )
+ 
+         if self.vllm_config.weight_transfer_config is not None:
+             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+-- 
+2.43.0
+

@@ -26,6 +26,15 @@ case "${1:-start}" in
       export VLLM_WORKER_MULTIPROC_METHOD=spawn HSA_FORCE_FINE_GRAIN_PCIE=1 VLLM_USE_BREAKABLE_CUDAGRAPH=1 VLLM_FORCE_CUSTOM_ALL_REDUCE=0 VLLM_FA_RDNA2_GQA_MODE=subgroup
       EXTRA="$EXTRA --trust-remote-code --compilation-config {\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"compile_ranges_endpoints\":[],\"max_cudagraph_capture_size\":16,\"cudagraph_capture_sizes\":[1,2,4,8,16]}"
     fi
+    if [ "${OGFX_PROD:-0}" = 1 ]; then   # config « production » d opengfx1030 du 19/09 (TP4+EP), transposée en PP3/TP1 :
+      # retirés car propres au TP : custom all-reduce, RCCL_P2P_*, NCCL_PROTO, EP ; NCCL_P2P_LEVEL reste PHB (pix coupe le P2P ici,
+      # pas de switch PCIe commun) ; KV 7e9 -> 3.5e9 (1/3 du modèle par carte au lieu de 1/4) ; vision off (--language-model-only).
+      export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0} VLLM_USE_AOT_COMPILE=0 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_USE_BREAKABLE_CUDAGRAPH=${BREAKABLE:-1}
+      export VLLM_RDNA_FUSED_HC=0 VLLM_ROCM_USE_AITER_MOE=0 VLLM_RDNA_FORCE_FP16=1 VLLM_BATCH_INVARIANT=0 GPU_MAX_HW_QUEUES=2
+      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False VLLM_WORKER_MULTIPROC_METHOD=spawn HSA_FORCE_FINE_GRAIN_PCIE=1
+      export PYTORCH_TUNABLEOP_ENABLED=${TUNABLEOP:-1} PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0 PYTORCH_TUNABLEOP_FILENAME=$CACHE/tunableop-ogfx/tunableop_results.csv; mkdir -p $CACHE/tunableop-ogfx
+      EXTRA="$EXTRA --trust-remote-code --block-size 16 --enable-prompt-tokens-details --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --distributed-timeout-seconds 1800 --compilation-config {\"cudagraph_mode\":\"${CGMODE:-FULL_AND_PIECEWISE}\",\"compile_ranges_endpoints\":[]${CGSIZES:+,\"cudagraph_capture_sizes\":[$CGSIZES],\"max_cudagraph_capture_size\":${CGSIZES##*,}}}"
+    fi
     cd $TREE
     setsid nohup python -m vllm.entrypoints.openai.api_server --model $MODEL --served-model-name flash-next --dtype float16 \
       --tensor-parallel-size 1 --pipeline-parallel-size $PP --distributed-executor-backend mp \

@@ -1,0 +1,25 @@
+From 29347931b0c84226283ae213840175d4a2dc37a8 Mon Sep 17 00:00:00 2001
+From: root <root@llama.2cprtech.com>
+Date: Tue, 15 Sep 2026 14:03:02 +0000
+Subject: [PATCH 2/6] v620-pp3: fix PleOffloadLayer import
+
+---
+ vllm/v1/worker/gpu_worker.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index bc5879a5a8..2ccc5af8a3 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -205,7 +205,7 @@ class Worker(WorkerBase):
+ 
+     def _model_has_ple_offload_layers(self) -> bool:
+         """Whether the loaded model on this rank contains a PLE offload layer."""
+-        from vllm.v1.ple_offload.connector import PleOffloadLayer
++        from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
+ 
+         model = self.model_runner.get_model()
+         return any(isinstance(m, PleOffloadLayer) for m in model.modules())
+-- 
+2.43.0
+
