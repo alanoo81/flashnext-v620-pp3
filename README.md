@@ -60,7 +60,7 @@ DENSE_INT8=1 DENSE_INT8_ONLY=1 MOE_PADDING=0 PART=17,17,14 CTX=262144 \
 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
 EXTRA='--speculative-config {"method":"mtp","num_speculative_tokens":2}' \
 scripts/vllm-pp3.sh start
-# = the 21 Sept production profile: 262K window, automatic KV (384K-token pool), partition 17,17,14, card order 1,2,0 — RESULTS §0b.
+# = the 21 Sept production profile: 262K window, automatic KV (465K-token pool = 1.77 full requests), partition 17,17,14, card order 1,2,0, 30-min soak clean — RESULTS §0b.
 # The 18 Sept reference of the tables: PART=17,18,13 CTX=131072 EXTRA='--kv-cache-memory-bytes 3500000000 …' (DEVS default).
 ```
 

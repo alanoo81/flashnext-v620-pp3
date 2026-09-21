@@ -55,11 +55,11 @@ The pool is not set by free memory alone: it is the minimum over stages of free-
 | 0,1,2 (43:00 = stage 0) | 141 W, junction 68 °C | 138 W, 57 °C | 138 W, 62 °C |
 | **1,2,0** (43:00 = stage 2, the lightest) | **133 W, 67 °C** | 145 W, 60 °C | 127 W, 65 °C |
 
-−8 W / −1 °C on the hot card, throughput unchanged (1 965 vs 1 983 tok/s prefill). Adopted since it is free; the real lever for that card is airflow.
+−8 W / −1 °C on the hot card, throughput unchanged (1 965 vs 1 983 tok/s prefill). Adopted since it is free; the real lever for that card is airflow. **Side effect on the KV pool**: with `DEVS=1,2,0` the automatic pool on 17,17,14 at 262K is **464 774 tokens** (twice, cold and warm boot) instead of 384K with `0,1,2` — the first visible card also carries the other processes' HIP contexts (PLE offload worker, API server), and with `1,2,0` those land on the lightest stage instead of stage 0, the tightest one.
 
 **Weight loading.** `--safetensors-load-strategy=prefetch` (vLLM only auto-enables it on network filesystems) with the page cache dropped before each boot: weights loaded in 78 s instead of 126, server ready in 196 s instead of 266. Now passed by default by the launcher (`PREFETCH=0` to disable).
 
-**Production profile from 21 Sept** (dashboard "Production", `scripts/vllm-pp3.sh`): W4A16-mtpq checkpoint, MTP k=2, `CTX=262144`, KV automatic with `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`, `PART=17,17,14`, `DEVS=1,2,0`, prefix caching on → **384K-token pool (1.46 full 262K requests, ~3 of 131K)**. The §0 tables and the bench suite keep the 18 Sept configuration (17,18,13, 131K, KV 3.5e9) as their reference.
+**Production profile from 21 Sept** (dashboard "Production", `scripts/vllm-pp3.sh`): W4A16-mtpq checkpoint, MTP k=2, `CTX=262144`, KV automatic with `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`, `PART=17,17,14`, `DEVS=1,2,0`, prefix caching on → **464 774-token pool (1.77 full 262K requests, 3.5 of 131K)**, validated by a second 30-min soak on this exact profile (138 iterations, 204 outputs, 0 errors, 3 corpus continuations, final burst clean, 0 GPU events, 0 server errors). The §0 tables and the bench suite keep the 18 Sept configuration (17,18,13, 131K, KV 3.5e9) as their reference.
 
 ## 1. Single stream, by context depth
 
