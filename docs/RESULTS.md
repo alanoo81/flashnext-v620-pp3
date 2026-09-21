@@ -57,6 +57,8 @@ The pool is not set by free memory alone: it is the minimum over stages of free-
 
 −8 W / −1 °C on the hot card, throughput unchanged (1 965 vs 1 983 tok/s prefill). Adopted since it is free; the real lever for that card is airflow.
 
+**Weight loading.** `--safetensors-load-strategy=prefetch` (vLLM only auto-enables it on network filesystems) with the page cache dropped before each boot: weights loaded in 78 s instead of 126, server ready in 196 s instead of 266. Now passed by default by the launcher (`PREFETCH=0` to disable).
+
 **Production profile from 21 Sept** (dashboard "Production", `scripts/vllm-pp3.sh`): W4A16-mtpq checkpoint, MTP k=2, `CTX=262144`, KV automatic with `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`, `PART=17,17,14`, `DEVS=1,2,0`, prefix caching on → **384K-token pool (1.46 full 262K requests, ~3 of 131K)**. The §0 tables and the bench suite keep the 18 Sept configuration (17,18,13, 131K, KV 3.5e9) as their reference.
 
 ## 1. Single stream, by context depth
