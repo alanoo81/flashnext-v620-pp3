@@ -12,6 +12,8 @@
 #    sous-alloue le KV (61K tokens) ; avec, 344-384K tokens à 262K, validé par 30 min de soak (marge ~0,5 Gio sur la carte la plus serrée).
 #  - (plus émis) "Auto-prefetch is disabled ... EXT4" : --safetensors-load-strategy=prefetch est passé d office (PREFETCH=0 pour l enlever) :
 #    à froid (cache disque vidé) poids en 78 s au lieu de 126, serveur prêt en 196 s au lieu de 266 (mesure du 21/09).
+# Réseau : le serveur écoute sur ${HOST:-0.0.0.0}:${PORT:-8086} (réseau de l hôte du CT, ex. http://192.168.1.252:8086/v1/models) ;
+#   HOST=127.0.0.1 pour le limiter au CT, API_KEY=<secret> pour exiger un jeton Bearer (vLLM --api-key).
 # Ordre des cartes : DEVS=<indices HSA> (défaut 0,1,2 = bus 43:00, 46:00, 63:00 -> étages 0,1,2). DEVS=1,2,0 met l étage 2
 # (le plus léger : 13-14 couches + drafter) sur la carte 43:00, la plus chaude (face au hub du ventilateur) : -8 W / -1 °C mesurés.
 IMG=${IMG:-ghcr.io/leapdragon/vllm-rdna2-qwen:latest}
@@ -74,6 +76,6 @@ case "${1:-start}" in
       --tensor-parallel-size 1 --pipeline-parallel-size $PP --distributed-executor-backend mp \
       --max-model-len $CTX --gpu-memory-utilization $GPUUTIL --max-num-seqs ${SEQS:-4} --max-num-batched-tokens ${MNBT:-2048} \
       --language-model-only --skip-mm-profiling ${NOPC:---enable-prefix-caching} ${EAGER:+--enforce-eager} $EXTRA \
-      --host 127.0.0.1 --port $PORT
+      --host ${HOST:-0.0.0.0} --port $PORT ${API_KEY:+--api-key $API_KEY}
     echo "conteneur $NAME lancé (arbre $TREE, PP=$PP, ctx=$CTX) ; logs: $0 logs" ;;
 esac
