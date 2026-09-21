@@ -12,6 +12,8 @@
 #    sous-alloue le KV (61K tokens) ; avec, 344-384K tokens à 262K, validé par 30 min de soak (marge ~0,5 Gio sur la carte la plus serrée).
 #  - (plus émis) "Auto-prefetch is disabled ... EXT4" : --safetensors-load-strategy=prefetch est passé d office (PREFETCH=0 pour l enlever) :
 #    à froid (cache disque vidé) poids en 78 s au lieu de 126, serveur prêt en 196 s au lieu de 266 (mesure du 21/09).
+# API : appels d outils (--enable-auto-tool-choice --tool-call-parser qwen3_coder) et raisonnement dans reasoning_content
+#   (--reasoning-parser qwen3) activés par défaut (TOOLS=0 pour les retirer) — requis par les clients agentiques (tool_choice=auto).
 # Réseau : le serveur écoute sur ${HOST:-0.0.0.0}:${PORT:-8086} (réseau de l hôte du CT, ex. http://192.168.1.252:8086/v1/models) ;
 #   HOST=127.0.0.1 pour le limiter au CT, API_KEY=<secret> pour exiger un jeton Bearer (vLLM --api-key).
 # Ordre des cartes : DEVS=<indices HSA> (défaut 0,1,2 = bus 43:00, 46:00, 63:00 -> étages 0,1,2). DEVS=1,2,0 met l étage 2
@@ -49,6 +51,8 @@ esac
 # tailles de capture piecewise pour les lots de prefill (leapdragon §8e) — CG_SIZES="1 2 4 8 16 32 64 128 256"
 [ -n "${CG_SIZES:-}" ] && EXTRA="$EXTRA --cudagraph-capture-sizes $CG_SIZES"
 [ "${PREFETCH:-1}" = 1 ] && EXTRA="$EXTRA --safetensors-load-strategy=prefetch"   # chargement des poids ~40 % plus rapide à froid
+# Clients agentiques (appels d outils, raisonnement séparé) : TOOLS=0 pour désactiver. Sans effet sur /v1/completions (harnais de mesure).
+[ "${TOOLS:-1}" = 1 ] && EXTRA="$EXTRA --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
 if [ "${UPSTREAM_ENV:-0}" = 1 ]; then   # pile d environnement de scripts/serve_gfx1030_full.sh (opengfx1030)
   COMMON+=(-e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_USE_RDNA2_FA=1 -e VLLM_ROCM_NO_MIXED_BATCH=0 -e VLLM_ROCM_SKIP_LIVE_TAIL_HASH=1
     -e VLLM_USE_AOT_COMPILE=0 -e VLLM_DISABLE_COMPILE_CACHE=1 -e VLLM_ROCM_USE_AITER_MOE=0 -e VLLM_RDNA_FORCE_FP16=1
