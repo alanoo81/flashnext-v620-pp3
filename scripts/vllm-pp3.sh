@@ -12,6 +12,9 @@
 #    sous-alloue le KV (61K tokens) ; avec, 344-384K tokens à 262K, validé par 30 min de soak (marge ~0,5 Gio sur la carte la plus serrée).
 #  - (plus émis) "Auto-prefetch is disabled ... EXT4" : --safetensors-load-strategy=prefetch est passé d office (PREFETCH=0 pour l enlever) :
 #    à froid (cache disque vidé) poids en 78 s au lieu de 126, serveur prêt en 196 s au lieu de 266 (mesure du 21/09).
+# Vision (VISION=1) : l encodeur d images tient, mais le profilage multimodal coûte ~3,5 Gio sur l étage 0 : à 262K le KV
+#   n a plus de place ; à 131K avec 1 image de <= 802 816 px : réservoir 211K jetons (au lieu de 465K en texte seul à 262K).
+#   Mesuré le 21/09 : capture d écran 1 000×450 décrite correctement en 9,6 s (556 jetons de prompt).
 # API : appels d outils (--enable-auto-tool-choice --tool-call-parser qwen3_coder) et raisonnement dans reasoning_content
 #   (--reasoning-parser qwen3) activés par défaut (TOOLS=0 pour les retirer) — requis par les clients agentiques (tool_choice=auto).
 # Réseau : le serveur écoute sur ${HOST:-0.0.0.0}:${PORT:-8086} (réseau de l hôte du CT, ex. http://192.168.1.252:8086/v1/models) ;
@@ -52,6 +55,10 @@ esac
 [ -n "${CG_SIZES:-}" ] && EXTRA="$EXTRA --cudagraph-capture-sizes $CG_SIZES"
 [ "${PREFETCH:-1}" = 1 ] && EXTRA="$EXTRA --safetensors-load-strategy=prefetch"   # chargement des poids ~40 % plus rapide à froid
 # Clients agentiques (appels d outils, raisonnement séparé) : TOOLS=0 pour désactiver. Sans effet sur /v1/completions (harnais de mesure).
+# Vision : VISION=1 charge l encodeur d images (captures d écran, photos) — VISION=0 (défaut) = texte seul, sans profilage multimodal.
+#   VISION_MAX_PIXELS (défaut 1605632 ≈ 1 460×1 100) et VISION_IMAGES (images max par requête, défaut 2).
+if [ "${VISION:-0}" = 1 ]; then MMARGS="--limit-mm-per-prompt {\"image\":${VISION_IMAGES:-2}} --mm-processor-kwargs {\"max_pixels\":${VISION_MAX_PIXELS:-1605632}}"
+else MMARGS="--language-model-only --skip-mm-profiling"; fi
 [ "${TOOLS:-1}" = 1 ] && EXTRA="$EXTRA --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
 if [ "${UPSTREAM_ENV:-0}" = 1 ]; then   # pile d environnement de scripts/serve_gfx1030_full.sh (opengfx1030)
   COMMON+=(-e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_USE_RDNA2_FA=1 -e VLLM_ROCM_NO_MIXED_BATCH=0 -e VLLM_ROCM_SKIP_LIVE_TAIL_HASH=1
@@ -79,7 +86,7 @@ case "${1:-start}" in
       --model /model --served-model-name flash-next --dtype float16 \
       --tensor-parallel-size 1 --pipeline-parallel-size $PP --distributed-executor-backend mp \
       --max-model-len $CTX --gpu-memory-utilization $GPUUTIL --max-num-seqs ${SEQS:-4} --max-num-batched-tokens ${MNBT:-2048} \
-      --language-model-only --skip-mm-profiling ${NOPC:---enable-prefix-caching} ${EAGER:+--enforce-eager} $EXTRA \
+      $MMARGS ${NOPC:---enable-prefix-caching} ${EAGER:+--enforce-eager} $EXTRA \
       --host ${HOST:-0.0.0.0} --port $PORT ${API_KEY:+--api-key $API_KEY}
     echo "conteneur $NAME lancé (arbre $TREE, PP=$PP, ctx=$CTX) ; logs: $0 logs" ;;
 esac
