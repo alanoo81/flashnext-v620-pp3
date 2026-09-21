@@ -30,6 +30,35 @@ Prefill, tok/s — MTP k=2 with the W4A16 drafter, ctx 131K, prefix caching **of
 
 What holds: **200 W = +13–17 % prefill and nothing on decode** (decode is memory-bound, prefill sits at the cap); **1 075 MHz ≈ +4 % decode without MTP** (three samples at 50.7–50.9 vs 48.8); the quantised drafter ≈ +5–10 % single stream and +17 % wall at 8 streams. Single-run MTP figures move by ±5 % from run to run (acceptance varies with the text). † The 4-stream no-MTP figure reproduced at exactly 139.5 on both caps and we cannot explain the gap to the morning's 157 — open. Thermals during the 130K prefill at 200 W: junction ≤ 80 °C, memory ≤ 64 °C (passive cards, server airflow).
 
+## 0b. 21 Sept — production configuration revised: 262K, automatic KV, partition 17,17,14, card order 1,2,0
+
+Three follow-ups on the §0 configuration, all at 160 W / 1 075 MHz.
+
+**Automatic KV sizing at 262K holds.** `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`, no `--kv-cache-memory-bytes`, window 262 144, MTP k=2 (W4A16 drafter), prefix caching on: pool 344K tokens on 17,18,13; 30-min `stab.py` soak (132 iterations, 195 outputs, 0 errors, 3 corpus continuations, final 4-stream burst clean, 0 GPU events). The pinned 3.5e9 of §0 was a workaround for the profiler's under-allocation, fixed by that variable.
+
+**Layer partition sweep** (262K, automatic KV, single 512-token probe):
+
+| partition | KV pool | VRAM stage 0 / 1 / 2 (GiB of 31.98) | decode 1 stream |
+|---|---|---|---|
+| 17,18,13 (§0) | 334K | 31.7 / 27.1 / 30.6 | 65.0 |
+| **17,17,14** | **384K (+15 %)** | 30.8 / 29.1 / 31.0 | 66.3 |
+| 16,18,14 | 344K | 31.8 / 28.7 / 29.4 | 66.1 |
+| 16,17,15 | 361K | 30.6 / 30.3 / 29.5 | 68.2 |
+| 15,18,15 | 280K | 31.7 / 29.4 / 26.9 | 58.0 |
+
+The pool is not set by free memory alone: it is the minimum over stages of free-memory ÷ bytes-per-token, and bytes per token depend on which layers (QSA paged KV vs GDN fixed state) a stage holds — which is why 16,17,15 has the most even VRAM but a smaller pool than 17,17,14. Stage 2 also carries the MTP drafter and `lm_head`; 15 layers there collapses the pool. 17,17,14 re-measured: 8 streams no MTP **244 (189 wall)** vs 249 (191) on 17,18,13; 4 staggered streams MTP 167 (121) vs 173 (125); prefill 1 725 / 1 956 at 16K / 65K vs 1 705 / 1 936 — all within noise, so the balanced partition costs nothing and buys 15 % of KV.
+
+**Card order (`ROCR_VISIBLE_DEVICES`, launcher `DEVS`).** HSA indices follow the PCI bus order (0 = 43:00, 1 = 46:00, 2 = 63:00, verified by the VRAM each card holds). The 43:00 card sits in front of the fan hub and runs hottest at equal power. A/B under the same prefill-heavy load (4 prompts of 65K/130K, 400 s of samples, 90 s idle between):
+
+| `DEVS` | 43:00 | 46:00 | 63:00 |
+|---|---|---|---|
+| 0,1,2 (43:00 = stage 0) | 141 W, junction 68 °C | 138 W, 57 °C | 138 W, 62 °C |
+| **1,2,0** (43:00 = stage 2, the lightest) | **133 W, 67 °C** | 145 W, 60 °C | 127 W, 65 °C |
+
+−8 W / −1 °C on the hot card, throughput unchanged (1 965 vs 1 983 tok/s prefill). Adopted since it is free; the real lever for that card is airflow.
+
+**Production profile from 21 Sept** (dashboard "Production", `scripts/vllm-pp3.sh`): W4A16-mtpq checkpoint, MTP k=2, `CTX=262144`, KV automatic with `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`, `PART=17,17,14`, `DEVS=1,2,0`, prefix caching on → **384K-token pool (1.46 full 262K requests, ~3 of 131K)**. The §0 tables and the bench suite keep the 18 Sept configuration (17,18,13, 131K, KV 3.5e9) as their reference.
+
 ## 1. Single stream, by context depth
 
 | stack | mode | 1K | 4K | 16K | 32K | 64K | 128K | 262K |

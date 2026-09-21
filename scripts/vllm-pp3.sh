@@ -1,6 +1,18 @@
 #!/bin/bash
 # vLLM Flash-Next sur 3× V620 en PP3/TP1 (table PLE int4 en RAM via le worker CPU)
 # Usage: TREE=/root/vllm-rdna|/root/vllm-leapdragon [PP=3] [CTX=65536] [GPUUTIL=0.95] [EXTRA="..."] ./vllm-pp3.sh [start|stop|logs|shell]
+#
+# Avertissements ATTENDUS dans le journal de démarrage (docker logs fn-pp3), à ne pas « corriger » :
+#  - "num_speculative_tokens > 1 ... lower acceptance rate" : générique ; k=2 mesuré meilleur que k=1 (52 -> 57-68 t/s), k=3 sans gain.
+#  - "Mamba cache mode is set to 'align'" : requis par le cache de préfixes sur les couches GDN (backport #54044 dans l overlay).
+#  - "max_num_scheduled_tokens is set to 2048 ... consider increasing max_num_batched_tokens" : 4096 mesuré -17..-27 % de prefill.
+#  - "Using FlashAttention version None" : pas de lib FA pour gfx1030, l attention passe par Triton (FLASH_ATTENTION_TRITON_AMD_ENABLE).
+#  - "Op 'sparse_attn_indexer' doesn't exist" : ajouté par vllm/platforms/rocm.py de l arbre leapdragon, sans effet (indexeur QSA en Triton).
+#  - "CUDA graph memory profiling is disabled (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0)" : voulu — sans cela le profileur
+#    sous-alloue le KV (61K tokens) ; avec, 344-384K tokens à 262K, validé par 30 min de soak (marge ~0,5 Gio sur la carte la plus serrée).
+#  - "Auto-prefetch is disabled ... EXT4" : ne concerne que le chargement des poids (47-83 s).
+# Ordre des cartes : DEVS=<indices HSA> (défaut 0,1,2 = bus 43:00, 46:00, 63:00 -> étages 0,1,2). DEVS=1,2,0 met l étage 2
+# (le plus léger : 13-14 couches + drafter) sur la carte 43:00, la plus chaude (face au hub du ventilateur) : -8 W / -1 °C mesurés.
 IMG=${IMG:-ghcr.io/leapdragon/vllm-rdna2-qwen:latest}
 TREE=${TREE:-/root/vllm-rdna}; NAME=${NAME:-fn-pp3}; PP=${PP:-3}; CTX=${CTX:-65536}; GPUUTIL=${GPUUTIL:-0.95}; PORT=${PORT:-8086}
 MODEL=${MODEL:-/root/models/flash-next/vllm/wtdcode-AWQ-W4A16}; PLE=/root/models/flash-next/vllm/ple-quant/ples_int4
