@@ -82,6 +82,17 @@ Observed with 7 coding agents (Oh my Pi) on the 131K + vision + MTP profile: pro
 
 Same rule on the text-only no-MTP profile at 262K: **16,16,16 → 565 757 tokens** vs 405 664 on 17,17,14 (VRAM 30.5 / 30.6 / 30.7). With MTP, 16,16,16 does **not** boot (the drafter sits on stage 2): **the partition is per profile — 17,17,14 with MTP, 16,16,16 without.** Decode 50–51 tok/s single stream in every case.
 
+**Vision stress on the Agentique + vision profile (16,16,16, 229K, ≤ 401 408 px, pool 527–537K)** — a reply to two reports from the community ("vision takes 15–20 s per image", "vLLM does not reserve memory for the image, a tight big context + image can OOM"):
+
+| test | result | peak VRAM stage 0 / 1 / 2 (GiB of 31.98) |
+|---|---|---|
+| one 1 000×450 screenshot alone, 1 output token, ×3 | **0.7–1.1 s** (420 image tokens); 0.9–1.4 s at ≤ 802 816 px (536 tokens) | — |
+| 186 261-token context + image, one request | OK, 95.7 s (prefill-bound) | 31.11 / 31.14 / 31.35 |
+| 2 × ~103K + image, concurrent | OK, 104 s | same |
+| 4 × ~62K + image, concurrent | OK, 125 s, 0 server errors | same (30.26 / 30.29 / 30.65 at ≤ 802 816 px, pool 394K) |
+
+The image encoder is a minor cost here (Torch SDPA, cost grows with pixels — the 1.6-Mpx default of other setups is 4× our patch count). The peak VRAM does not depend on the scenario: the KV pool is pre-allocated and activations stay inside the profiler's reserve, so the 0.6 GiB margin at the tightest stage held through every test. No OOM observed; the automatic pool is kept, with that margin noted as the constraint of this profile.
+
 Dashboard profiles as of 21 Sept evening: Production (MTP, 262K, 17,17,14, 465K pool) · Production + vision (MTP, 131K, 211K) · Agentique (no MTP, 8 seqs, 262K, 16,16,16, 566K) · Agentique + vision (no MTP, 8 seqs, 229K, ≤ 401 408 px, 16,16,16, 537K) · Reference (the §0 configuration).
 
 ## 1. Single stream, by context depth
