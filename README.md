@@ -26,6 +26,10 @@ Multi-stream, decode only (512-token prompts, 18 Sept): **without MTP 48.8 → 1
 
 The combined line ran 30 minutes of random-size/burst traffic at 131K context (134 iterations, 0 errors, 0 corrupted outputs), 4-stream bursts clean, and a 262K server (KV pool 293K tokens at `--kv-cache-memory-bytes 3.5e9`, VRAM 30.9 / 30.0 / 29.9 GiB of 31.98). Decode above 32K is measured on the streaming client and should be confirmed with server counters; no clean prefill figure exists yet at 261K (the earlier 2 716 tok/s included prefix-cache hits). Full tables: [`docs/RESULTS.md`](docs/RESULTS.md).
 
+## Reproduce the numbers
+
+`scripts/bench/bench.sh quick|decode|conc|prefill|full|quality|soak` (inside the serving container/CT, `scripts/bench/run-bench.sh` is the host wrapper that also watches `dmesg` for GPU events) replays the RESULTS §0 measurements with the same harness, prompts and options, then `bench-report.py` prints a "this run / published / deviation" table with tolerances (±5–8 % single-stream decode, ±6 % prefill, ±10–15 % multi-stream). It checks the preconditions of the published figures first (160 W cap, VRAM 1 075 MHz, no other server running).
+
 ## What is in here
 
 ```
