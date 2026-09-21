@@ -12,5 +12,5 @@ echo "=== $(date +%H:%M:%S) stab.py 30 min"
 python3 /root/stab.py 8086 vllm 30 --tag soak-best | grep -E "SUSPECT|^==|!!!" | tail -12
 echo "=== $(date +%H:%M:%S) rafale finale"
 python3 /root/burst.py 8086 4 --tag soak-best | grep -E "rafale|après"
-echo "erreurs réelles dans le log serveur (hors avertissements transformers/default_loader): $(docker logs fn-pp3 2>&1 | grep -E "\bERROR\b|Traceback|\bhang|[Ff]ault\b|hipError|HSA_STATUS" | grep -viE "rope_parameters|default_loader|Unrecognized keys" | wc -l)"
+echo "erreurs réelles dans le log serveur (hors avertissements transformers/default_loader): $(docker logs fn-pp3 2>&1 | grep -E "\bERROR\b|Traceback|\bhang|\b[Ff]ault\b|hipError|HSA_STATUS" | grep -viE "rope_parameters|default_loader|Unrecognized keys" | wc -l)"
 ./vllm-pp3.sh stop >/dev/null 2>&1; echo "=== FIN SOAK $(date +%H:%M:%S)"
