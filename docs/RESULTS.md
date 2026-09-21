@@ -61,6 +61,29 @@ The pool is not set by free memory alone: it is the minimum over stages of free-
 
 **Production profile from 21 Sept** (dashboard "Production", `scripts/vllm-pp3.sh`): W4A16-mtpq checkpoint, MTP k=2, `CTX=262144`, KV automatic with `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`, `PART=17,17,14`, `DEVS=1,2,0`, prefix caching on → **464 774-token pool (1.77 full 262K requests, 3.5 of 131K)**, validated by a second 30-min soak on this exact profile (138 iterations, 204 outputs, 0 errors, 3 corpus continuations, final burst clean, 0 GPU events, 0 server errors). The §0 tables and the bench suite keep the 18 Sept configuration (17,18,13, 131K, KV 3.5e9) as their reference.
 
+## 0c. 21 Sept evening — agent workloads: no-MTP profiles, vision, and a second partition sweep
+
+Observed with 7 coding agents (Oh my Pi) on the 131K + vision + MTP profile: prompts of 25–35K (later 60–75K) tokens, prefill-bound (1 500–1 700 tok/s at the cap), **130 preemptions** on a 211K-token pool with `--max-num-seqs 4`, TTFT 80–180 s. Two levers, both measured:
+
+**No MTP for agent workloads.** Beyond ~4 streams MTP locks the scheduler (§3) and its drafter takes stage-2 memory; without it, 8 streams decode at 244–249 tok/s aggregate and the pool grows. Under a 7-agent load the no-MTP + vision profile held **150+ tok/s aggregate continuously, 0 preemptions**, limited only by KV (4 running × ~75K tokens = 81 % of a 370K pool).
+
+**Vision costs stage-0 memory through the multimodal profiling budget, not the encoder.** `VISION=1` (encoder ≈ 0.5 GiB) at 262K: no room left for KV, boot fails. At 131K with 1 image ≤ 802 816 px: pool 211K (MTP) / 234K (no MTP). The pixel cap is the lever: at ≤ 401 408 px (≈ 800×500) the encoder-cache budget shrinks by ~2.5 GiB and the pool jumps to **370K** at 229K (262K cannot boot in vision: the pool must hold one full request). A 1 000×450 screenshot is read correctly in 5 s at either cap.
+
+**Partition sweep, no MTP + vision, 229K, ≤ 401 408 px, `--max-num-seqs 8`, automatic KV:**
+
+| partition | KV pool | VRAM stage 0 / 1 / 2 (GiB) | outcome |
+|---|---|---|---|
+| 17,17,14 | 370 195 | 31.5 / 27.6 / 31.6 | reference (the MTP-era partition) |
+| 16,17,15 | — | — | GPU memory access fault during load (43:00, UTCL2/CPF, one-off, not reproduced) |
+| 15,18,15 | — | — | KV pool smaller than the 229K window: init fails |
+| 15,17,16 | 329 546 | 31.7 / 29.8 / 28.0 | worse |
+| **16,16,16** | **536 681 (+45 %)** | **31.5 / 31.5 / 31.7** | best — three equal stages once the drafter is gone |
+| 14,18,16 | — | — | KV pool smaller than the window |
+
+Same rule on the text-only no-MTP profile at 262K: **16,16,16 → 565 757 tokens** vs 405 664 on 17,17,14 (VRAM 30.5 / 30.6 / 30.7). With MTP, 16,16,16 does **not** boot (the drafter sits on stage 2): **the partition is per profile — 17,17,14 with MTP, 16,16,16 without.** Decode 50–51 tok/s single stream in every case.
+
+Dashboard profiles as of 21 Sept evening: Production (MTP, 262K, 17,17,14, 465K pool) · Production + vision (MTP, 131K, 211K) · Agentique (no MTP, 8 seqs, 262K, 16,16,16, 566K) · Agentique + vision (no MTP, 8 seqs, 229K, ≤ 401 408 px, 16,16,16, 537K) · Reference (the §0 configuration).
+
 ## 1. Single stream, by context depth
 
 | stack | mode | 1K | 4K | 16K | 32K | 64K | 128K | 262K |
