@@ -53,6 +53,16 @@ case "${TUNEOP:-0}" in
 esac
 # tailles de capture piecewise pour les lots de prefill (leapdragon §8e) — CG_SIZES="1 2 4 8 16 32 64 128 256"
 [ -n "${CG_SIZES:-}" ] && EXTRA="$EXTRA --cudagraph-capture-sizes $CG_SIZES"
+# Équité prefill/décodage : LONGPREFILL=<jetons> plafonne le morceau de prefill traité par pas d ordonnancement.
+# ATTENTION : sans effet au-dessus de MNBT (2048 par défaut), puisque le morceau y est déjà borné — il faut une
+# valeur INFÉRIEURE. Plus la valeur est basse, plus les requêtes en décodage avancent pendant qu un long prompt
+# est lu, mais plus le prefill total est lent (davantage de pas, chacun avec son coût fixe). 0 = désactivé.
+# (--max-num-partial-prefills n existe PAS dans cette build, seul ce seuil est disponible.)
+[ "${LONGPREFILL:-0}" != 0 ] && EXTRA="$EXTRA --long-prefill-token-threshold ${LONGPREFILL}"
+# Anti-emballement du cache KV : WATERMARK=<0..1> garde cette fraction de blocs libres à l admission d une requête
+# en attente ou préemptée. Vise le cycle admission -> remplissage à 100 % -> préemption -> recalcul observé avec 7 agents
+# à gros contextes. 0 = désactivé (défaut amont). `scheduler_reserve_full_isl` est déjà à True et couvre le premier cas.
+[ -n "${WATERMARK:-}" ] && EXTRA="$EXTRA --watermark ${WATERMARK}"
 [ "${PREFETCH:-1}" = 1 ] && EXTRA="$EXTRA --safetensors-load-strategy=prefetch"   # chargement des poids ~40 % plus rapide à froid
 # Clients agentiques (appels d outils, raisonnement séparé) : TOOLS=0 pour désactiver. Sans effet sur /v1/completions (harnais de mesure).
 # Vision : VISION=1 charge l encodeur d images (captures d écran, photos) — VISION=0 (défaut) = texte seul, sans profilage multimodal.

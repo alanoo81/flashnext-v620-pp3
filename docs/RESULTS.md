@@ -95,6 +95,44 @@ The image encoder is a minor cost here (Torch SDPA, cost grows with pixels — t
 
 Dashboard profiles as of 21 Sept evening: Production (MTP, 262K, 17,17,14, 465K pool) · Production + vision (MTP, 131K, 211K) · Agentique (no MTP, 8 seqs, 262K, 16,16,16, 566K) · Agentique + vision (no MTP, 8 seqs, 229K, ≤ 401 408 px, 16,16,16, 537K) · Reference (the §0 configuration).
 
+## 0d. 22 Sept — prefill/decode fairness: chunk the long prefills
+
+The agent workload of 21 Sept exposed a scheduling problem that is not a throughput problem. While a long prompt is
+being read, every scheduling step is filled by one 2 048-token prefill chunk (~1.2 s), so the other requests advance
+**one token per step** — about 1 tok/s — and a request that arrives during the read waits for the whole prefill.
+
+Measured (`scripts/prefill-fair.py`): one 121 000-token prompt, two short requests ("capital of France", 3 words)
+arriving 2 s and 4 s later, Agentique + vision profile, `--max-num-batched-tokens 2048`:
+
+| `--long-prefill-token-threshold` | TTFT of the short requests | server prefill | long request, total | short requests, total |
+|---|---|---|---|---|
+| **off (default)** | **56.1 s / 54.1 s** | 1 825 tok/s | 60.2 s | 57.4 / 55.4 s |
+| 1 024 | 3.1 s / 2.8 s | 1 670 (−8 %) | 68.7 s (+14 %) | 65.1 / 63.1 s |
+| **512** | **1.8 s / 1.7 s** | 1 645 (−10 %) | 72.0 s (+20 %) | **37.6 / 37.5 s** |
+| 256 | 1.6 s / 1.6 s | 1 195 (−35 %) | 100.2 s (+66 %) | 29.7 / 29.5 s |
+
+**512 is the knee, and it is better than the default on every metric that matters to a short request**: first token in
+1.8 s instead of 56, and *completion* in 37.5 s instead of 55.4 — because a smaller chunk means more interleaved decode
+steps (1.1 tok/s during the read instead of 0.6 at 1 024). The long request pays 20 %, the server prefill 10 %.
+At 256 the TTFT barely improves (1.6 vs 1.8) while prefill collapses by 35 % and the long request takes 66 % longer.
+
+Adopted on both agentic profiles (`LONGPREFILL=512` in `scripts/vllm-pp3.sh`). Not on the MTP production profiles,
+which serve one or few streams where the long request's own latency is what counts.
+
+**Two traps.** The threshold is **inert above `--max-num-batched-tokens`** (2 048 here): the chunk is already bounded
+there, so the values of several thousand tokens found in most write-ups do nothing at all. And
+`--max-num-partial-prefills` **does not exist in this build** — only the threshold. Upstream v0.30.0 has the same
+2 048 default and the same `0` default for the threshold, so the trap transposes.
+
+**Two related scheduler settings found while reading the code, not yet tested here:**
+- `--watermark` (0.0 by default, i.e. off): fraction of KV blocks kept free when admitting a waiting or preempted
+  request. Its own documentation describes the admit → fill → preempt → recompute cycle seen with 7 agents on
+  21 Sept. Exposed as `WATERMARK=` in the launcher, **untested**.
+- `scheduler_reserve_full_isl`, already `True` by default: the scheduler checks that the *whole* input sequence fits
+  before admitting, not just the first chunk — the first line of defence against that same thrashing.
+- `prefill_schedule_interval` looks relevant but is **inert outside data parallelism**: the base engine's
+  `_should_throttle_prefills` returns `False` unconditionally and is only overridden by the DP engine core.
+
 ## 1. Single stream, by context depth
 
 | stack | mode | 1K | 4K | 16K | 32K | 64K | 128K | 262K |
