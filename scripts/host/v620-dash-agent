@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Agent du tableau de bord V620 (hôte PVE).
+
+Toutes les 3 s : lit l'état des 3 cartes (sysfs amdgpu), du ventilateur (hwmon arctic_fan) et du serveur vLLM
+du CT 100 (/health, /metrics, journal du conteneur), et écrit status.json + console.txt dans /srv/v620-dash/status/,
+répertoire monté en lecture seule dans le CT du portail (110) sous /srv/live. Les actions demandées par la page
+(fichier /srv/v620-dash/cmd/request, écrit par le CGI du portail) sont validées contre une liste blanche puis
+exécutées via `pct exec 100`. Aucune commande ni aucun paramètre libre ne vient du web.
+Dépendances : python3 de base. RAM ~15-20 Mo. Journal : journalctl -u v620-dash-agent.
+"""
+import collections, glob, json, os, re, shlex, subprocess, sys, threading, time
+
+CT = "100"
+STATUS_DIR = "/srv/v620-dash/status"
+CMD_FILE = "/srv/v620-dash/cmd/request"
+PORT = 8086
+IMG = "ghcr.io/leapdragon/vllm-rdna2-qwen:20260915-g1bdbbef4b"
+MODELS_ROOT = "/root/models/flash-next/vllm"
+COMMON = dict(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="0", MOE_HIP="1", CG_SIZES="1 2 4 8 16 32 64 128 256",
+              IMG=IMG, TREE="image", DENSE_INT8="1", DENSE_INT8_ONLY="1", MOE_PADDING="0")
+MTP = '--speculative-config {"method":"mtp","num_speculative_tokens":2}'
+DEVS_DEFAULT = "1,2,0"   # ordre des cartes (indices HSA) -> étages PP : l étage 2 (le plus léger) sur 43:00, la carte la plus chaude (A/B du 21/09)
+# Profils prédéfinis (liste blanche). Voir la page Démarrage rapide du portail pour le détail de chaque option.
+PROFILES = {
+    "prod":   dict(label="Production — MTP k=2, contexte 262K, réservoir KV automatique (~465K jetons), jusqu'à ~4 flux",
+                   default_model="wtdcode-AWQ-W4A16-mtpq",
+                   env=dict(PART="17,17,14", CTX="262144", EXTRA=MTP)),
+    "prodvision": dict(label="Production + vision — MTP k=2, contexte 131K, 1 image/requête (captures d'écran), réservoir ~211K jetons",
+                   default_model="wtdcode-AWQ-W4A16-mtpq",
+                   env=dict(PART="17,17,14", CTX="131072", VISION="1", VISION_IMAGES="1", VISION_MAX_PIXELS="802816", EXTRA=MTP)),
+    "agentvision": dict(label="Agentique + vision — sans MTP, prefill découpé à 512, 4 séquences (5 bloque dès qu un agent dépasse ~170K, essai du 23/09), contexte 229K, images ≤ 401 408 px, partition 16,16,16, réservoir ~537K jetons",
+                   default_model="wtdcode-AWQ-W4A16",
+                   env=dict(PART="16,16,16", CTX="229376", SEQS="4", VISION="1", VISION_IMAGES="1", VISION_MAX_PIXELS="401408", LONGPREFILL="512", EXTRA="")),
+    "agent":  dict(label="Agentique — sans MTP, prefill découpé à 512, 5 séquences (contextes d'agents ~100K), contexte 262K, texte seul, partition 16,16,16, réservoir ~566K jetons",
+                   default_model="wtdcode-AWQ-W4A16",
+                   env=dict(PART="16,16,16", CTX="262144", SEQS="5", LONGPREFILL="512", EXTRA="")),
+    "ref131": dict(label="Référence des tableaux publiés — MTP k=2, 131K, KV fixé 3,5 Go, partition 17,18,13",
+                   default_model="wtdcode-AWQ-W4A16-mtpq",
+                   env=dict(PART="17,18,13", CTX="131072", DEVS="0,1,2", EXTRA="--kv-cache-memory-bytes 3500000000 " + MTP)),
+}
+# Cartes : card<n> DRM -> bus PCI ; le rang PP (ROCR_VISIBLE_DEVICES 0,1,2) suit l'ordre des bus.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+def rd(p, default=None):
+    try:
+        with open(p) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+def rdi(p, div=1, default=None):
+    v = rd(p)
+    try:
+        return int(v) / div if div != 1 else int(v)
+    except (TypeError, ValueError):
+        return default
+
+def dpm_current(p):
+    for line in (rd(p) or "").splitlines():
+        if line.endswith("*"):
+            m = re.search(r"(\d+)Mhz", line)
+            if m:
+                return int(m.group(1))
+    return None
+
+def gpus():
+    out = []
+    for dev in sorted(glob.glob("/sys/class/drm/card[0-9]/device")):
+        if not os.path.exists(dev + "/mem_info_vram_total"):
+            continue
+        card = dev.split("/")[-2]
+        bus = os.path.basename(os.path.realpath(dev))
+        hw = (glob.glob(dev + "/hwmon/hwmon*") or [None])[0]
+        g = dict(card=card, bus=bus[5:] if bus.startswith("0000:") else bus,
+                 vram_used_gib=round((rdi(dev + "/mem_info_vram_used") or 0) / 2**30, 2),
+                 vram_total_gib=round((rdi(dev + "/mem_info_vram_total") or 0) / 2**30, 2),
+                 busy=rdi(dev + "/gpu_busy_percent"), sclk_mhz=dpm_current(dev + "/pp_dpm_sclk"),
+                 mclk_mhz=dpm_current(dev + "/pp_dpm_mclk"))
+        if hw:
+            # pp_dpm_mclk ne marque pas toujours le niveau courant ; les capteurs hwmon freq1/freq2 (Hz) sont fiables
+            f1, f2 = rdi(hw + "/freq1_input"), rdi(hw + "/freq2_input")
+            if f1: g["sclk_mhz"] = round(f1 / 1e6)
+            if f2: g["mclk_mhz"] = round(f2 / 1e6)
+            g.update(power_w=rdi(hw + "/power1_average", 1e6), cap_w=rdi(hw + "/power1_cap", 1e6),
+                     t_edge=rdi(hw + "/temp1_input", 1000), t_junction=rdi(hw + "/temp2_input", 1000),
+                     t_mem=rdi(hw + "/temp3_input", 1000))
+        out.append(g)
+    # Étage PP de chaque carte : ROCR_VISIBLE_DEVICES du conteneur (indices HSA, eux-mêmes dans l'ordre des bus PCI :
+    # 0 = 43:00, 1 = 46:00, 2 = 63:00 — vérifié le 21/09 par la VRAM chargée), le rang i prend le i-ème indice listé.
+    order = sorted(out, key=lambda g: g["bus"])
+    devs = DEVS_CACHE.get("devs") or [0, 1, 2]
+    for g in out:
+        g["pp_rank"] = None
+    for rank, idx in enumerate(devs):
+        if 0 <= idx < len(order):
+            order[idx]["pp_rank"] = rank
+    return out
+
+DEVS_CACHE = {"devs": None, "ts": 0}
+def refresh_devs():
+    """Lit ROCR_VISIBLE_DEVICES du conteneur fn-pp3 (toutes les 30 s) ; défaut 0,1,2 quand rien ne tourne."""
+    if time.time() - DEVS_CACHE["ts"] < 30:
+        return
+    DEVS_CACHE["ts"] = time.time()
+    out = sh(["pct", "exec", CT, "--", "sh", "-c", "docker inspect fn-pp3 --format '{{range .Config.Env}}{{println .}}{{end}}===STARTED{{.State.StartedAt}}===ARGS{{.Args}}' 2>/dev/null"])
+    ms = re.search(r"===STARTED([^=\s]+)", out)
+    DEVS_CACHE["started"] = ms.group(1) if ms else None
+    pool = sh(["pct", "exec", CT, "--", "sh", "-c", "docker logs fn-pp3 2>&1 | grep -oE 'GPU KV cache size: [0-9,]+' | tail -1 | tr -dc 0-9"])
+    DEVS_CACHE["pool"] = int(pool) if pool.strip().isdigit() else None
+    m = re.search(r"ROCR_VISIBLE_DEVICES=([0-9,]+)", out)
+    DEVS_CACHE["devs"] = [int(x) for x in m.group(1).split(",")] if m else None
+    # profil en cours, déduit des arguments réels du conteneur (et non de ce que le tableau de bord a lancé en dernier)
+    out = re.sub(r"===STARTED[^=\s]+", "", out)   # ne pas avaler le marqueur ===ARGS qui suit sans espace
+    env, args = out.split("===ARGS", 1) if "===ARGS" in out else (out, "")
+    if args:
+        g = lambda k: (re.search(k + r" (\S+)", args) or [None, None])[1]
+        r = dict(ctx=int(g("--max-model-len") or 0) or None, seqs=int(g("--max-num-seqs") or 0) or None,
+                 mtp=("num_speculative_tokens" in args), vision=("--limit-mm-per-prompt" in args),
+                 kv=("--kv-cache-memory-bytes" in args), tools=("--enable-auto-tool-choice" in args),
+                 longprefill=int((re.search(r"--long-prefill-token-threshold (\d+)", args) or [0, 0])[1]),
+                 part=(re.search(r"VLLM_PP_LAYER_PARTITION=([0-9,]+)", env) or [None, None])[1],
+                 devs=",".join(str(x) for x in DEVS_CACHE["devs"]) if DEVS_CACHE["devs"] else None)
+        r["profile"] = None
+        for k, p in PROFILES.items():
+            e = p["env"]
+            if (int(e.get("CTX", 0)) == r["ctx"] and ("num_speculative_tokens" in e.get("EXTRA", "")) == r["mtp"]
+                    and (e.get("VISION") == "1") == r["vision"] and ("--kv-cache-memory-bytes" in e.get("EXTRA", "")) == r["kv"]
+                    and (int(e.get("SEQS", 4)) == (r["seqs"] or 4))
+                    and (int(e.get("LONGPREFILL", 0)) == r["longprefill"])):
+                r["profile"] = k; r["label"] = p["label"]; break
+        DEVS_CACHE["running"] = r
+    else:
+        DEVS_CACHE["running"] = None
+
+FAN_CURVE_FILE = "/etc/v620/fan-curve"
+FAN_CURVE_DEFAULT = [(45, 30), (60, 55), (75, 85)]
+FAN_TMAX, FAN_PMIN = 80, 30
+
+def read_fan_curve():
+    """Points (temp, pct) du fichier de courbe s'il est valide, sinon la courbe par défaut ; même règles que gpu-fan-control."""
+    try:
+        pts = [tuple(int(x) for x in l.split()) for l in open(FAN_CURVE_FILE) if l.strip()]
+        if valid_fan_curve(pts):
+            return pts, "fichier"
+    except (OSError, ValueError):
+        pass
+    return FAN_CURVE_DEFAULT, "défaut"
+
+def valid_fan_curve(pts):
+    if not 1 <= len(pts) <= 8:
+        return False
+    last = -1
+    for t, p in pts:
+        if not (last < t <= FAN_TMAX and FAN_PMIN <= p <= 100):
+            return False
+        last = t
+    return True
+
+def fan(gl):
+    hw = None
+    for n in glob.glob("/sys/class/hwmon/hwmon*/name"):
+        if rd(n) == "arctic_fan":
+            hw = os.path.dirname(n)
+    f = dict(present=hw is not None)
+    if hw:
+        pwm = rdi(hw + "/pwm1")
+        f.update(pwm=pwm, pct=round(pwm * 100 / 255) if pwm is not None else None, rpm=rdi(hw + "/fan1_input"))
+    f["worst_junction"] = max([g.get("t_junction") or 0 for g in gl] or [0])
+    f["worst_temp"] = max([max(g.get("t_junction") or 0, g.get("t_mem") or 0) for g in gl] or [0])  # gpu-fan-control suit max(junction, mémoire)
+    pts, src = read_fan_curve()
+    f["curve_points"] = pts; f["curve_source"] = src; f["curve_default"] = FAN_CURVE_DEFAULT
+    f["curve_rules"] = dict(tmax=FAN_TMAX, pmin=FAN_PMIN, failsafe=85, max_points=8)
+    f["curve"] = " · ".join(f"{t} °C : {p} %" for t, p in pts) + f" · > {pts[-1][0]} °C : 100 % · sécurité ≥ 85 °C : 100 %"
+    return f
+
+def sh(cmd, timeout=10):
+    """Exécute cmd dans sa propre session ; au délai, tue toute la session (pct exec laisse des petits-enfants qui
+    garderaient les tubes ouverts et bloqueraient subprocess.run pour toujours)."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                             text=True, start_new_session=True)
+    except OSError:
+        return ""
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        return out
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, 9)
+        except OSError:
+            pass
+        try:
+            out, _ = p.communicate(timeout=5)
+        except Exception:
+            out = ""
+        return out or ""
+
+CT_PROBE = r'''
+curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:PORT/health; echo
+echo ===MODELS; curl -s -m 2 http://127.0.0.1:PORT/v1/models
+echo; echo ===METRICS; curl -s -m 3 http://127.0.0.1:PORT/metrics | grep -E "^vllm:(num_requests_running|num_requests_waiting|prompt_tokens_total|generation_tokens_total|kv_cache_usage_perc|gpu_cache_usage_perc|prefix_cache_hits_total|prefix_cache_queries_total|request_prompt_tokens_sum|request_generation_tokens_sum|request_generation_tokens_count|time_to_first_token_seconds_sum|time_to_first_token_seconds_count|request_prefill_time_seconds_sum|request_decode_time_seconds_sum|inter_token_latency_seconds_count|spec_decode_num_draft_tokens_total|spec_decode_num_accepted_tokens_total|num_preemptions_total)"
+echo ===DOCKER; docker ps -a --filter name=^fn-pp3$ --format "{{.Status}}" 2>/dev/null
+echo ===NATIVE; pgrep -f "openai.api_serve[r]" >/dev/null && echo yes || echo no
+echo ===LOG; if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^fn-pp3$"; then docker logs --tail 150 fn-pp3 2>&1; elif pgrep -f "openai.api_serve[r]" >/dev/null; then tail -n 150 /root/vllm-native.log 2>/dev/null; else tail -n 60 /root/dash-launch.log 2>/dev/null; fi
+'''.replace("PORT", str(PORT))
+
+class Agent:
+    def __init__(self):
+        self.hist = collections.deque(maxlen=40)   # (t, prompt_total, gen_total)
+        self.mhist = collections.deque(maxlen=80)  # (t, dict des compteurs cumulés) pour les moyennes par fenêtre
+        self.busy = collections.deque(maxlen=80)   # (t, secondes occupées cumulées, jetons générés cumulés pendant l occupation)
+        self.timeline = collections.deque(maxlen=60)  # un point par relevé : phase (prefill/génération/mixte/inactif) et débits
+        self.last_kv = None; self.gl_now = []
+        self.busy_acc = [0.0, 0.0]                 # depuis le démarrage du serveur
+        self.action = dict(last=None, result=None, ts=None, busy=False)
+        self.models = []
+        self.models_ts = 0
+        self.ready_since = None
+        self.last_rate = {}
+
+    def refresh_models(self):
+        if time.time() - self.models_ts < 60:
+            return
+        out = sh(["pct", "exec", CT, "--", "sh", "-c", f"ls -d {MODELS_ROOT}/*/config.json 2>/dev/null"])
+        self.models = sorted(p.split("/")[-2] for p in out.split() if p.startswith(MODELS_ROOT)) or self.models
+        self.models_ts = time.time()
+
+    def probe_ct(self):
+        out = sh(["pct", "exec", CT, "--", "sh", "-c", CT_PROBE], timeout=20)
+        parts = re.split(r"^===([A-Z]+)\n?", out, flags=re.M)
+        head, sec = parts[0].strip(), {}
+        for i in range(1, len(parts) - 1, 2):
+            sec[parts[i]] = parts[i + 1]
+        v = dict(health=head[:3] if head else "", model=None, running=None, waiting=None, kv_pct=None,
+                 cache_hit_pct=None, prompt_total=None, gen_total=None, container=(sec.get("DOCKER", "").strip() or None),
+                 native=(sec.get("NATIVE", "").strip() == "yes"))
+        try:
+            v["model"] = json.loads(sec.get("MODELS", ""))["data"][0]["id"]
+        except Exception:
+            pass
+        m = {}
+        for line in sec.get("METRICS", "").splitlines():
+            mm = re.match(r"^vllm:(\w+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)", line)
+            if mm:
+                m[mm.group(1)] = m.get(mm.group(1), 0.0) + float(mm.group(2))
+        if m:
+            v.update(running=int(m.get("num_requests_running", 0)), waiting=int(m.get("num_requests_waiting", 0)),
+                     prompt_total=m.get("prompt_tokens_total"), gen_total=m.get("generation_tokens_total"))
+            kv = m.get("kv_cache_usage_perc", m.get("gpu_cache_usage_perc"))
+            if kv is not None:
+                v["kv_pct"] = round(kv * 100, 1)
+            q = m.get("prefix_cache_queries_total") or 0
+            if q:
+                v["cache_hit_pct"] = round(100 * (m.get("prefix_cache_hits_total") or 0) / q, 1)
+        v["state"] = ("prêt" if v["health"] == "200" else "arrêt en cours" if self.action.get("busy") and self.action["last"] == "stop"
+                      else "démarrage" if (v["container"] or "").startswith("Up") or v["native"] else "arrêté")
+        if v["state"] == "prêt":
+            self.ready_since = self.ready_since or time.time()
+        else:
+            self.ready_since = None
+            self.hist.clear()
+        v["ready_for_s"] = int(time.time() - self.ready_since) if self.ready_since else None
+        # « démarré depuis » = date de démarrage du conteneur (survit aux redémarrages de cet agent)
+        st = DEVS_CACHE.get("started")
+        v["container_started"] = st
+        try:
+            import datetime
+            t = datetime.datetime.fromisoformat(st.replace("Z", "+00:00")[:26] + "+00:00") if st else None
+            v["container_up_s"] = int(time.time() - t.timestamp()) if t else None
+        except Exception:
+            v["container_up_s"] = None
+        now = time.time()
+        if v["prompt_total"] is not None:
+            self.hist.append((now, v["prompt_total"], v["gen_total"] or 0))
+        # Débit instantané = différence entre les deux derniers relevés (3 s) quand des jetons ont été produits ;
+        # on garde en plus le dernier débit non nul observé (une requête de 200 jetons dure moins de 10 s).
+        v["prompt_tps_now"] = v["gen_tps_now"] = None
+        if len(self.hist) >= 2:
+            (t0, p0, g0), (t1, p1, g1) = self.hist[-2], self.hist[-1]
+            if t1 - t0 > 0.5:
+                if p1 > p0:
+                    v["prompt_tps_now"] = round((p1 - p0) / (t1 - t0), 1)
+                if g1 > g0:
+                    v["gen_tps_now"] = round((g1 - g0) / (t1 - t0), 1)
+        for key in ("prompt", "gen"):
+            if v[f"{key}_tps_now"] and v[f"{key}_tps_now"] * 3 >= 30:   # ignore les fins de requête (quelques jetons)
+                self.last_rate[key] = (v[f"{key}_tps_now"], int(now))
+            v[f"{key}_tps_last"], v[f"{key}_tps_last_ts"] = self.last_rate.get(key, (None, None))
+        old = [h for h in self.hist if now - h[0] >= 58]
+        v["prompt_tps60"] = v["gen_tps60"] = None
+        if old and self.hist[-1][0] - old[-1][0] > 1:
+            t0, p0, g0 = old[-1]; t1, p1, g1 = self.hist[-1]
+            v["prompt_tps60"] = round((p1 - p0) / (t1 - t0), 1); v["gen_tps60"] = round((g1 - g0) / (t1 - t0), 1)
+        # Moyennes « à la vLLM » : rapports de compteurs cumulés (temps passé en prefill / en décodage par requête,
+        # TTFT, MTP), sur la dernière minute et depuis le démarrage — indépendantes des temps morts, contrairement
+        # au débit brut jetons / temps mur.
+        if m:
+            # temps « occupé » = intervalles entre relevés où au moins une requête était en cours ; jetons générés dessus
+            if self.mhist:
+                t_prev, m_prev = self.mhist[-1]
+                dt = now - t_prev
+                dg = m.get("generation_tokens_total", 0) - m_prev.get("generation_tokens_total", 0)
+                self._pending_busy = (dt, dg)   # comptabilisé plus bas, une fois la phase connue
+            if self.mhist:
+                t_prev, m_prev = self.mhist[-1]; dt = max(0.5, now - t_prev)
+                dp = m.get("prompt_tokens_total", 0) - m_prev.get("prompt_tokens_total", 0)
+                dg = m.get("generation_tokens_total", 0) - m_prev.get("generation_tokens_total", 0)
+                kv_now, kv_prev = v.get("kv_pct"), self.last_kv
+                pool = DEVS_CACHE.get("pool") or 0
+                kv_growth_tok = max(0.0, (kv_now - kv_prev) / 100 * pool) if (kv_now is not None and kv_prev is not None) else 0.0
+                busy = sum(g.get("busy") or 0 for g in self.gl_now) / max(1, len(self.gl_now)) if self.gl_now else 0
+                # la génération alloue aussi des blocs KV (1 jeton = 1 emplacement) : seule la croissance AU-DELÀ des jetons
+                # générés trahit un prefill en cours
+                prefilling = dp > 50 or (kv_growth_tok - dg) > 300 or (busy > 80 and dg / dt < 3 and (v["running"] or 0) > 0)
+                generating = dg / dt >= 3
+                phase = "mixte" if prefilling and generating else "prefill" if prefilling else "génération" if dg > 0 else "inactif"
+                pf = round(max(dp, kv_growth_tok - dg) / dt) if prefilling else 0   # compteur (fin de requête) ou croissance du KV hors génération
+                self.timeline.append(dict(t=int(now), phase=phase, prefill=pf, gen=round(dg / dt, 1), running=v["running"], waiting=v["waiting"], busy=round(busy), kv=v.get("kv_pct")))
+                self.last_kv = kv_now
+                # « génération agrégée » = jetons générés / temps des relevés en phase génération ou mixte ; les relevés
+                # de prefill (où les autres requêtes ne reçoivent qu un jeton par chunk, ~1 j/s) sont exclus.
+                if phase in ("génération", "mixte") and dg > 0:
+                    self.busy_acc[0] += dt; self.busy_acc[1] += dg
+            self.mhist.append((now, m)); self.busy.append((now, self.busy_acc[0], self.busy_acc[1]))
+        elif v["state"] != "prêt":
+            self.mhist.clear(); self.busy.clear(); self.busy_acc = [0.0, 0.0]
+        def stats(m0, m1):
+            d = lambda k: (m1.get(k, 0) - (m0.get(k, 0) if m0 else 0))
+            r = dict(requetes=int(d("request_generation_tokens_count")))
+            pt, ptime = d("request_prompt_tokens_sum"), d("request_prefill_time_seconds_sum")
+            gt, dtime, steps = d("request_generation_tokens_sum"), d("request_decode_time_seconds_sum"), d("inter_token_latency_seconds_count")
+            tt, tc = d("time_to_first_token_seconds_sum"), d("time_to_first_token_seconds_count")
+            dr, ac = d("spec_decode_num_draft_tokens_total"), d("spec_decode_num_accepted_tokens_total")
+            r["prefill_tps"] = round(pt / ptime, 0) if ptime > 0.05 else None
+            r["decode_tps_flux"] = round(gt / dtime, 1) if dtime > 0.05 else None
+            r["ms_par_pas"] = round(1000 * dtime / steps, 1) if steps else None
+            r["jetons_par_pas"] = round(gt / steps, 2) if steps else None
+            r["ttft_s"] = round(tt / tc, 2) if tc else None
+            r["prompt_moyen"] = int(pt / tc) if tc else None
+            r["mtp_acceptation_pct"] = round(100 * ac / dr, 0) if dr else None
+            r["preemptions"] = int(d("num_preemptions_total"))
+            return r
+        v["stats_total"] = stats(None, m) if m else None
+        if not m and v["state"] == "prêt" and getattr(self, "last_stats", None):
+            v["stats_total"], v["stats60"], v["stats_stale"] = self.last_stats[0], self.last_stats[1], True
+            self.missed = getattr(self, "missed", 0) + 1
+            v["missed_probes"] = self.missed
+        old = [h for h in self.mhist if now - h[0] >= 58] or ([self.mhist[0]] if self.mhist and now - self.mhist[0][0] >= 20 else [])
+        v["stats60"] = stats(old[-1][1], m) if (m and old) else None
+        # décodage agrégé (tous flux) = jetons générés / temps occupé ; concurrence moyenne = Σ temps de décodage / temps occupé
+        def agg(st, b0, b1):
+            if st is None or b1 is None: return
+            bt, bg = b1[1] - (b0[1] if b0 else 0), b1[2] - (b0[2] if b0 else 0)
+            st["gen_agrege_tps"] = round(bg / bt, 1) if bt > 1 else None
+            st["temps_occupe_s"] = round(bt)
+        if self.busy and m:
+            agg(v["stats_total"], None, self.busy[-1])
+            oldb = [h for h in self.busy if now - h[0] >= 58] or ([self.busy[0]] if now - self.busy[0][0] >= 20 else [])
+            agg(v["stats60"], oldb[-1] if oldb else None, self.busy[-1])
+        if m:
+            self.last_stats = (v["stats_total"], v["stats60"])
+        console = ANSI.sub("", sec.get("LOG", ""))
+        # on retire les sondes de cet agent (/metrics, /v1/models, /health toutes les 3 s) du journal affiché
+        lines = [l for l in console.splitlines() if not re.search(r'"GET /(metrics|v1/models|health) HTTP', l)]
+        console = "\n".join(line[:400] for line in lines[-150:])
+        return v, console
+
+    # ---- actions -------------------------------------------------------------------------
+    def read_request(self):
+        try:
+            with open(CMD_FILE) as f:
+                kv = dict(line.split("=", 1) for line in f.read().splitlines() if "=" in line)
+            os.remove(CMD_FILE)
+        except OSError:
+            return None
+        return kv
+
+    def run_action(self, kv):
+        a, p, m = kv.get("action", ""), kv.get("profile", ""), kv.get("model", "")
+        if self.action.get("busy") and time.time() - (self.action.get("ts") or 0) > 240:
+            self.action.update(busy=False, result="délai dépassé, action abandonnée")   # garde-fou contre un worker bloqué
+        if self.action.get("busy"):
+            self.action.update(result="une action est déjà en cours, requête ignorée", ts=time.time()); return
+        if a in ("fancurve", "fancurve_reset"):
+            if a == "fancurve_reset":
+                try: os.remove(FAN_CURVE_FILE)
+                except OSError: pass
+                self.action.update(last="courbe de ventilation : défaut", result="rétablie (45:30 60:55 75:85)", ts=time.time()); return
+            try:
+                pts = [tuple(int(x) for x in pt.split(":")) for pt in kv.get("points", "").split(",") if pt]
+            except ValueError:
+                pts = []
+            if not valid_fan_curve(pts):
+                self.action.update(last="courbe de ventilation", result=f"refusée : {len(pts)} point(s), il faut des températures croissantes ≤ {FAN_TMAX} °C et {FAN_PMIN}-100 %", ts=time.time()); return
+            os.makedirs(os.path.dirname(FAN_CURVE_FILE), exist_ok=True)
+            with open(FAN_CURVE_FILE + ".tmp", "w") as f:
+                f.write("".join(f"{t} {p}\n" for t, p in pts))
+            os.replace(FAN_CURVE_FILE + ".tmp", FAN_CURVE_FILE)
+            self.action.update(last="courbe de ventilation", result="appliquée : " + " ".join(f"{t}:{p}" for t, p in pts) + " (relue par gpu-fan-control sous 5 s)", ts=time.time()); return
+        if a == "stop":
+            cmd = "cd /root && ./vllm-pp3.sh stop >/dev/null 2>&1; ./vllm-native-pp3.sh stop >/dev/null 2>&1; echo stop-ok"
+            label = "stop"
+        elif a == "start" and p in PROFILES:
+            # Verrou de sécurité : pas de charge GPU sans ventilation pilotée. Après une mise à jour du noyau, les
+            # modules hors-arbre (arctic_fan_controller, amdgpu patché) manquent : ventilateur non commandé ET
+            # plafond de puissance remonté à 250 W d'usine. Vu le 24/09. Voir « Après une mise à jour du noyau ».
+            fan_ok = sh(["systemctl", "is-active", "gpu-fan-control"]).strip() == "active"
+            caps = [rdi(h + "/power1_cap", 1e6) for h in sorted(glob.glob("/sys/class/drm/card[0-9]/device/hwmon/hwmon*"))]
+            if not fan_ok or any(c and c > 200 for c in caps):
+                self.action.update(last=f"start {p}", result="REFUSÉ : " + ("ventilation GPU hors service (gpu-fan-control inactif)" if not fan_ok else "")
+                                   + (" ; " if not fan_ok and any(c and c > 200 for c in caps) else "")
+                                   + (f"plafond de puissance à {max(c for c in caps if c):.0f} W (module amdgpu patché absent ?)" if any(c and c > 200 for c in caps) else "")
+                                   + " — relancer v620-rebuild-amdgpu ou démarrer sur le noyau précédent, puis redémarrer l'hôte", ts=time.time()); return
+            prof = PROFILES[p]
+            self.refresh_models()
+            if m not in self.models:
+                m = prof["default_model"]
+            if m not in self.models:
+                self.action.update(last=f"start {p}", result=f"modèle inconnu : {m}", ts=time.time()); return
+            env = dict(COMMON); env.update(prof["env"]); env["MODEL"] = f"{MODELS_ROOT}/{m}"
+            env.setdefault("DEVS", DEVS_DEFAULT)
+            envstr = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+            # tout est redirigé/détaché côté CT : aucun descendant ne doit hériter du tube de sortie de pct exec
+            cmd = (f"cd /root && ./vllm-pp3.sh stop >/dev/null 2>&1 </dev/null; ./vllm-native-pp3.sh stop >/dev/null 2>&1 </dev/null; "
+                   f"setsid env {envstr} ./vllm-pp3.sh start > /root/dash-launch.log 2>&1 </dev/null && echo start-ok")
+            label = f"start {p} ({m})"
+        else:
+            self.action.update(last=str(kv)[:80], result="requête refusée (hors liste blanche)", ts=time.time()); return
+        self.action.update(last=label, result="en cours…", ts=time.time(), busy=True)
+        def worker():
+            out = sh(["pct", "exec", CT, "--", "sh", "-c", cmd], timeout=180)
+            ok = "start-ok" in out or "stop-ok" in out
+            self.action.update(result="lancé, voir la console" if ok and a == "start" else "arrêté" if ok else f"échec : {out.strip()[-160:] or 'pas de réponse'}", ts=time.time(), busy=False)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def loop(self):
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        while True:
+            t0 = time.time()
+            try:
+                kv = self.read_request()
+                if kv:
+                    self.run_action(kv)
+                self.refresh_models()
+                refresh_devs()
+                gl = gpus(); self.gl_now = gl
+                v, console = self.probe_ct()
+                v["running_profile"] = DEVS_CACHE.get("running")
+                v["timeline"] = list(self.timeline)
+                v["phase"] = self.timeline[-1]["phase"] if self.timeline and v["state"] == "prêt" else None
+                st = dict(ts=int(t0), gpus=gl, fan=fan(gl), vllm=v,
+                          fan_service=sh(["systemctl", "is-active", "gpu-fan-control"]).strip(),
+                          action={k: self.action[k] for k in ("last", "result", "ts", "busy")},
+                          profiles=[dict(id=k, label=p["label"], default_model=p["default_model"]) for k, p in PROFILES.items()],
+                          models=self.models, load=os.getloadavg()[0], hostname=os.uname().nodename)
+                for name, data in (("status.json", json.dumps(st, ensure_ascii=False)), ("console.txt", console)):
+                    tmp = os.path.join(STATUS_DIR, name + ".tmp")
+                    with open(tmp, "w") as f:
+                        f.write(data)
+                    os.chmod(tmp, 0o644); os.replace(tmp, os.path.join(STATUS_DIR, name))
+            except Exception as e:  # ne jamais mourir sur une lecture ratée
+                print("agent:", repr(e), file=sys.stderr, flush=True)
+            time.sleep(max(0.5, 3 - (time.time() - t0)))
+
+if __name__ == "__main__":
+    Agent().loop()

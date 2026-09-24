@@ -133,6 +133,28 @@ there, so the values of several thousand tokens found in most write-ups do nothi
 - `prefill_schedule_interval` looks relevant but is **inert outside data parallelism**: the base engine's
   `_should_throttle_prefills` returns `False` unconditionally and is only overridden by the DP engine core.
 
+## 0e. 24 Sept — a routine kernel update silently disabled fan control and the power cap
+
+An unattended `proxmox-kernel` update moved the host from `7.0.14-17-pve` to `7.0.14-19-pve`. The out-of-tree modules
+live in the previous kernel's `extra/`, so after the reboot: **no GPU fan control** (`arctic_fan_controller` absent,
+`gpu-fan-control` crash-looping), **power cap back to the 250 W factory floor** (`v620-powercap` failing), VRAM back to
+1 000 MHz. Nothing overheated only because no load ran.
+
+Rebuilding against `-19` then failed: the PVE kernel back-ports a DRM API change, `drm_exec_for_each_locked_object`
+going from `(exec, index, obj)` to `(exec, obj)` with the index internal to the macro. Four call sites in our 7.0.14
+amdgpu source used the old form (`amdgpu_cs.c` x3, `amdgpu_eviction_fence.c` x1); `make -k` showed they were the only
+errors in the whole module. None uses the index in the loop body, so dropping the argument is neutral — the compiler
+confirms it by then flagging the variables as unused. `scripts/host/v620-rebuild-amdgpu` now adapts the source to
+whichever form the target headers define.
+
+Also changed: the script no longer installs the patched `atlantic` driver by default (`ATLANTIC=1` to restore it).
+It is the host's **network** driver; a failure to load at boot makes the headless machine unreachable, and it only
+provides DASH, whose sole working function here is remote power-on.
+
+Two interlocks were added: the dashboard agent refuses to start a server while `gpu-fan-control` is inactive or a
+power cap exceeds 200 W, and `scripts/vllm-pp3.sh` refuses above 200 W (exit 3, `FORCE=1` to override).
+After the rebuild on `-19`: patched modules loaded, 160 W, 1 075 MHz, fan controlled, 0 GPU events.
+
 ## 1. Single stream, by context depth
 
 | stack | mode | 1K | 4K | 16K | 32K | 64K | 128K | 262K |

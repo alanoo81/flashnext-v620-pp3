@@ -69,7 +69,10 @@ esac
 #   VISION_MAX_PIXELS (défaut 1605632 ≈ 1 460×1 100) et VISION_IMAGES (images max par requête, défaut 2).
 if [ "${VISION:-0}" = 1 ]; then MMARGS="--limit-mm-per-prompt {\"image\":${VISION_IMAGES:-2}} --mm-processor-kwargs {\"max_pixels\":${VISION_MAX_PIXELS:-1605632}}"
 else MMARGS="--language-model-only --skip-mm-profiling"; fi
-[ "${TOOLS:-1}" = 1 ] && EXTRA="$EXTRA --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+# TOOLS=1 : appels d outils (l analyseur ne travaille qu en fin de génération). REASONING=1 : sépare le raisonnement
+# dans le champ `reasoning` — ATTENTION, il analyse CHAQUE jeton de CHAQUE flux dans le serveur d API mono-thread.
+[ "${TOOLS:-1}" = 1 ] && EXTRA="$EXTRA --enable-auto-tool-choice --tool-call-parser qwen3_coder"
+[ "${REASONING:-1}" = 1 ] && EXTRA="$EXTRA --reasoning-parser qwen3"
 if [ "${UPSTREAM_ENV:-0}" = 1 ]; then   # pile d environnement de scripts/serve_gfx1030_full.sh (opengfx1030)
   COMMON+=(-e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_USE_RDNA2_FA=1 -e VLLM_ROCM_NO_MIXED_BATCH=0 -e VLLM_ROCM_SKIP_LIVE_TAIL_HASH=1
     -e VLLM_USE_AOT_COMPILE=0 -e VLLM_DISABLE_COMPILE_CACHE=1 -e VLLM_ROCM_USE_AITER_MOE=0 -e VLLM_RDNA_FORCE_FP16=1
@@ -85,6 +88,19 @@ if [ "$TREE" = image ]; then   # arbre leapdragon compilé dans l image + nos 3 
   COMMON+=(-w /app/vllm)
 else
   COMMON+=(-v $TREE:${TREE_MNT:-/src} -w ${TREE_MNT:-/src})
+fi
+# Garde-fou : un plafond de puissance au-dessus de 200 W signale que le module amdgpu patché n'est pas chargé — ce qui,
+# après une mise à jour du noyau, va de pair avec la perte du pilotage du ventilateur (modules hors-arbre reconstruits
+# ensemble par v620-rebuild-amdgpu). Pas de charge GPU dans cet état. FORCE=1 pour passer outre en connaissance de cause.
+if [ "${1:-start}" = start ] && [ "${FORCE:-0}" != 1 ]; then
+  for c in /sys/class/drm/card[0-9]/device/hwmon/hwmon*/power1_cap; do
+    w=$(( $(cat "$c" 2>/dev/null || echo 0) / 1000000 ))
+    if [ "$w" -gt 200 ]; then
+      echo "REFUS : plafond de puissance à ${w} W (attendu 160). Module amdgpu patché absent, ventilation probablement non pilotée." >&2
+      echo "        Après une mise à jour du noyau : v620-rebuild-amdgpu puis redémarrage, ou démarrer sur le noyau précédent. FORCE=1 pour passer outre." >&2
+      exit 3
+    fi
+  done
 fi
 case "${1:-start}" in
   shell) docker run --rm -it --entrypoint bash "${COMMON[@]}" $IMG ;;

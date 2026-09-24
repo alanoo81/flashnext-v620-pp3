@@ -1,0 +1,60 @@
+#!/bin/bash
+# Reconstruit le module amdgpu patché « V620 powerfix » ET le module arctic_fan_controller ET le module atlantic avec DASH
+# (driver hwmon du kernel 7.2 compilé hors-arbre) après une mise à jour du kernel PVE.
+# À lancer après tout upgrade de proxmox-kernel, puis reboot.
+# Source patchée persistante : /root/v620-build/linux-7.0.14/ (patch déjà appliqué dedans).
+set -e
+KREL=$(uname -r)
+SRC=/root/v620-build/linux-7.0.14
+
+grep -q "V620 powerfix" $SRC/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c \
+    || { echo "ERREUR: source patchée introuvable dans $SRC"; exit 1; }
+
+echo ">> Headers pour $KREL"
+apt-get install -y "proxmox-headers-$KREL"
+mkdir -p "/usr/src/linux-headers-$KREL/drivers/gpu/drm/amd/amdgpu"
+cp $SRC/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h "/usr/src/linux-headers-$KREL/drivers/gpu/drm/amd/amdgpu/"
+
+echo ">> Adaptation de l'API drm_exec au noyau cible"
+# Les noyaux PVE récents (vu sur 7.0.14-19) rétroportent un changement DRM : drm_exec_for_each_locked_object passe de
+# (exec, index, obj) à (exec, obj), l'index devenant interne à la macro. Notre source amdgpu 7.0.14 utilise l'ancienne
+# forme sur 4 appels (amdgpu_cs.c x3, amdgpu_eviction_fence.c x1), dont aucun n'utilise l'index dans le corps de boucle :
+# le changement est neutre. On adapte la source dans un sens ou dans l'autre selon les en-têtes du noyau cible.
+cd $SRC/drivers/gpu/drm/amd/amdgpu
+if grep -q "define drm_exec_for_each_locked_object(exec, obj)" "/usr/src/linux-headers-$KREL/include/drm/drm_exec.h"; then
+  sed -i -E 's/drm_exec_for_each_locked_object\(([^,]+),\s*index,\s*/drm_exec_for_each_locked_object(\1, /' amdgpu_cs.c amdgpu_eviction_fence.c
+  echo "   noyau à macro 2 arguments : source adaptée"
+else
+  for f in amdgpu_cs.c amdgpu_eviction_fence.c; do [ -f $f.orig-3arg ] && cp -p $f.orig-3arg $f; done
+  echo "   noyau à macro 3 arguments : source d'origine"
+fi
+
+echo ">> Build"
+cd $SRC
+make -C "/lib/modules/$KREL/build" M=$PWD/drivers/gpu/drm/amd/amdgpu clean >/dev/null
+make -C "/lib/modules/$KREL/build" M=$PWD/drivers/gpu/drm/amd/amdgpu -j"$(nproc)" modules
+
+echo ">> Module arctic_fan_controller (backport 7.2 hors-arbre, ventilateur GPU)"
+make -C /root/v620-build/arctic_fan_controller clean >/dev/null
+make -C /root/v620-build/arctic_fan_controller KREL="$KREL"
+mkdir -p "/lib/modules/$KREL/extra"
+install -m 0644 /root/v620-build/arctic_fan_controller/arctic_fan_controller.ko "/lib/modules/$KREL/extra/"
+
+# atlantic = pilote RÉSEAU de l'hôte. S'il ne se charge pas au redémarrage, la machine devient injoignable (sans écran).
+# Il n'apporte que le DASH (allumage à distance). Désactivé par défaut depuis le 24/09 : ATLANTIC=1 pour l'installer.
+if [ "${ATLANTIC:-0}" = 1 ]; then
+  echo ">> Module atlantic + DASH (genetlink aq-dash porté sur atlantic 7.0.14, carte Marvell AQC107 FW 4.2.46)"
+  make -C "/lib/modules/$KREL/build" M=/root/v620-build/atlantic-dash clean >/dev/null
+  make -C "/lib/modules/$KREL/build" M=/root/v620-build/atlantic-dash CONFIG_AQTION=m -j"$(nproc)" modules
+  install -m 0644 /root/v620-build/atlantic-dash/atlantic.ko "/lib/modules/$KREL/extra/atlantic.ko"
+else
+  echo ">> atlantic (DASH) ignoré : pilote réseau d'origine conservé (ATLANTIC=1 pour l'installer)"
+  rm -f "/lib/modules/$KREL/extra/atlantic.ko"
+fi
+
+echo ">> Install override"
+mkdir -p "/lib/modules/$KREL/extra"
+install -m 0644 drivers/gpu/drm/amd/amdgpu/amdgpu.ko "/lib/modules/$KREL/extra/amdgpu.ko"
+depmod -a
+update-initramfs -u -k "$KREL"
+echo ">> OK — reboot pour charger le module patché ($(modinfo -k $KREL amdgpu | grep -m1 filename))"
